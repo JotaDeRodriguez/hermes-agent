@@ -22,6 +22,12 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+# When this file is executed as a script, log_aggregate imports "fetch_logs".
+# Alias __main__ so that import reuses this module instead of loading a second
+# copy with its own timers/constants.
+if __name__ == "__main__":
+    sys.modules.setdefault("fetch_logs", sys.modules[__name__])
+
 # Load .env sitting next to this script.
 load_dotenv(Path(__file__).with_name(".env"))
 
@@ -50,23 +56,37 @@ def _check_env(names: list[str]) -> None:
 
 # --- Railway -----------------------------------------------------------------
 RAILWAY_GRAPHQL = "https://backboard.railway.com/graphql/v2"
-RAILWAY_BATCH = 1000      # logs requested per environmentLogs page
+RAILWAY_BATCH = 5000      # logs requested per environmentLogs page
 RAILWAY_MAX_PAGES = 500   # safety cap on backward pagination
 
 # --- Supabase ----------------------------------------------------------------
 # Analytics/logs endpoints live under /v0 (see supabase_experimental_api.yaml).
 SUPABASE_API = "https://api.supabase.com/v0"
 SUPABASE_ROW_CAP = 1000   # Management API caps each query at 1000 rows
-SUPABASE_DATASETS = [
-    "edge_logs",
-    "auth_logs",
+# High-volume datasets are aggregated server-side (log_aggregate) — pulling
+# their rows and bisecting the 1000-row cap never finished within the cron
+# window. The rest are low-volume: raw rows + client-side digest in one query.
+SUPABASE_AGG_DATASETS = ("edge_logs", "auth_logs")
+SUPABASE_RAW_DATASETS = (
     "postgres_logs",
     "function_logs",
     "storage_logs",
     "realtime_logs",
-]
+)
+# Wall-clock budget for the whole Supabase phase. The cron runs the script via
+# a terminal tool with a ~120s timeout, and a timeout yields NO output at all
+# (the run + its tokens are wasted). This budget guarantees we stop and emit
+# whatever we have — with a per-dataset `truncated` marker — well inside that
+# window. Override with SUPABASE_BUDGET_S.
+SUPABASE_BUDGET_S = float(os.environ.get("SUPABASE_BUDGET_S", "90"))
 # Log endpoint is limited to 30 req/min; pace requests to stay well under it.
 RATE_LIMIT_SLEEP_S = 2.5
+# Aggregation fires several independent GROUP BY queries per dataset, each of
+# which spends most of its wall-clock time in the BigQuery backend (~10s), so
+# running them concurrently is what actually keeps the run inside the cron's
+# terminal timeout. Kept small so the in-flight request count stays well under
+# the 30 req/min cap.
+SUPABASE_MAX_WORKERS = 6
 
 
 def _utcnow() -> datetime:
@@ -173,12 +193,14 @@ def railway_logs(hours: int) -> list[dict]:
 
 
 # --- Supabase ----------------------------------------------------------------
-def _supabase_query(url, headers, dataset, start, end) -> list[dict]:
-    sql = (
-        f"select timestamp, event_message, metadata "
-        f"from {dataset} order by timestamp desc limit {SUPABASE_ROW_CAP}"
-    )
-    time.sleep(RATE_LIMIT_SLEEP_S)
+def _supabase_sql(url, headers, sql, start, end, pace=True) -> list[dict]:
+    """Run one analytics SQL query over [start, end) and return its result rows.
+    The shared low-level runner for both the raw row-pull and the server-side
+    aggregation in log_aggregate. ``pace`` adds the sequential rate-limit sleep;
+    the parallel aggregation path sets pace=False and bounds its request rate
+    with a small thread pool instead."""
+    if pace:
+        time.sleep(RATE_LIMIT_SLEEP_S)
     resp = requests.get(
         url,
         headers=headers,
@@ -190,24 +212,40 @@ def _supabase_query(url, headers, dataset, start, end) -> list[dict]:
         timeout=120,
     )
     if resp.status_code != 200:
-        _log(f"Supabase {dataset} HTTP {resp.status_code}: {resp.text[:200]}")
+        _log(f"Supabase HTTP {resp.status_code}: {resp.text[:200]}")
     resp.raise_for_status()
     body = resp.json()  # AnalyticsResponse = {"result": [...], "error": str|object}
+    # The backend can return HTTP 200 with an error payload (e.g. a 499 "Job
+    # timed out" from BigQuery), so check the body too.
     if body.get("error"):
-        raise RuntimeError(f"Supabase logs error for {dataset}: {body['error']}")
+        raise RuntimeError(f"Supabase logs error: {body['error']}")
     return body.get("result", [])
 
 
-def _supabase_collect(url, headers, dataset, start, end, out) -> None:
-    """Query [start, end); bisect the window whenever the row cap is hit."""
+def _supabase_query(url, headers, dataset, start, end) -> list[dict]:
+    return _supabase_sql(
+        url, headers,
+        f"select timestamp, event_message, metadata "
+        f"from {dataset} order by timestamp desc limit {SUPABASE_ROW_CAP}",
+        start, end,
+    )
+
+
+def _supabase_collect(url, headers, dataset, start, end, out, deadline) -> bool:
+    """Query [start, end); bisect the window whenever the row cap is hit.
+
+    Returns True if collection was cut short by the wall-clock ``deadline``
+    (so the caller can flag the dataset as truncated rather than complete)."""
+    if time.monotonic() > deadline:
+        return True
     rows = _supabase_query(url, headers, dataset, start, end)
     if len(rows) >= SUPABASE_ROW_CAP and (end - start) > timedelta(seconds=1):
         _log(f"    {dataset} hit {SUPABASE_ROW_CAP}-row cap, bisecting "
              f"{_iso(start)}..{_iso(end)}")
         mid = start + (end - start) / 2
-        _supabase_collect(url, headers, dataset, start, mid, out)
-        _supabase_collect(url, headers, dataset, mid, end, out)
-        return
+        t1 = _supabase_collect(url, headers, dataset, start, mid, out, deadline)
+        t2 = _supabase_collect(url, headers, dataset, mid, end, out, deadline)
+        return t1 or t2
     if len(rows) >= SUPABASE_ROW_CAP:
         print(
             f"WARNING: {dataset} hit the {SUPABASE_ROW_CAP}-row cap in a <=1s window "
@@ -215,31 +253,78 @@ def _supabase_collect(url, headers, dataset, start, end, out) -> None:
             file=sys.stderr,
         )
     out.extend(rows)
+    return False
 
 
-def supabase_logs(hours: int) -> dict[str, list[dict]]:
+def _supabase_collect_raw(url, headers, dataset, start, now, deadline) -> list[dict]:
+    """Raw row pull for one dataset, bisecting on the cap, then deduped."""
+    _log(f"  supabase {dataset}: querying {_iso(start)}..{_iso(now)}...")
+    rows: list[dict] = []
+    truncated = _supabase_collect(url, headers, dataset, start, now, rows, deadline)
+    seen: set[tuple] = set()
+    deduped = []
+    for r in rows:
+        key = (r.get("timestamp"), r.get("event_message"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    _log(f"  supabase {dataset}: {len(rows)} rows -> {len(deduped)} after dedup"
+         + (" [TRUNCATED by budget]" if truncated else ""))
+    return deduped
+
+
+def supabase_logs(hours: int, raw: bool = False) -> dict:
+    """Collect Supabase logs as a per-dataset map. By default the high-volume
+    datasets are returned as already-built digest dicts (server-side
+    aggregation) and low-volume ones as raw row lists for build_digest to
+    aggregate. With ``raw=True`` every dataset is returned as raw rows (the
+    --raw debug path). The whole phase is bounded by SUPABASE_BUDGET_S so the
+    cron never times out empty-handed."""
+    # Lazy imports: log_digest / log_aggregate import from this module, so
+    # importing them here (after everything above is defined) avoids a cycle.
+    from log_aggregate import auth_digest, edge_digest
+    from log_digest import HISTOGRAM_BUCKETS
+
     now = _utcnow()
     start = now - timedelta(hours=hours)
+    bucket = (now - start) / HISTOGRAM_BUCKETS
     ref = os.environ["SUPABASE_PROJECT_REF"]
     url = f"{SUPABASE_API}/projects/{ref}/analytics/endpoints/logs.all"
     headers = {"Authorization": f"Bearer {os.environ['SUPABASE_ACCESS_TOKEN']}"}
+    deadline = time.monotonic() + SUPABASE_BUDGET_S
 
-    out: dict[str, list[dict]] = {}
-    for dataset in SUPABASE_DATASETS:
-        _log(f"  supabase {dataset}: querying {hours}h window...")
-        rows: list[dict] = []
-        _supabase_collect(url, headers, dataset, start, now, rows)
-        # Dedup any rows double-counted at bisection boundaries.
-        seen: set[tuple] = set()
-        deduped = []
-        for r in rows:
-            key = (r.get("timestamp"), r.get("event_message"))
-            if key in seen:
+    out: dict = {}
+
+    # --raw: every dataset as raw rows (debugging). Bounded by the deadline.
+    if raw:
+        for dataset in (*SUPABASE_AGG_DATASETS, *SUPABASE_RAW_DATASETS):
+            if time.monotonic() > deadline:
+                _log(f"  supabase {dataset}: SKIPPED (budget exceeded)")
+                out[dataset] = []
                 continue
-            seen.add(key)
-            deduped.append(r)
-        out[dataset] = deduped
-        _log(f"  supabase {dataset}: {len(rows)} rows -> {len(deduped)} after dedup")
+            out[dataset] = _supabase_collect_raw(url, headers, dataset, start, now, deadline)
+        return out
+
+    # High-volume: server-side GROUP BY aggregation (bounded, no bisection).
+    aggregators = {"edge_logs": edge_digest, "auth_logs": auth_digest}
+    for dataset in SUPABASE_AGG_DATASETS:
+        if time.monotonic() > deadline:
+            _log(f"  supabase {dataset}: SKIPPED (budget "
+                 f"{SUPABASE_BUDGET_S:.0f}s exceeded)")
+            out[dataset] = {"rows": 0, "truncated": True, "histogram": {}}
+            continue
+        _log(f"  supabase {dataset}: aggregating server-side ({hours}h)...")
+        out[dataset] = aggregators[dataset](url, headers, start, now, bucket, deadline)
+        _log(f"  supabase {dataset}: rows={out[dataset].get('rows')}")
+
+    # Low-volume: raw rows + client digest, bounded by the same deadline.
+    for dataset in SUPABASE_RAW_DATASETS:
+        if time.monotonic() > deadline:
+            _log(f"  supabase {dataset}: SKIPPED (budget exceeded)")
+            out[dataset] = []
+            continue
+        out[dataset] = _supabase_collect_raw(url, headers, dataset, start, now, deadline)
     return out
 
 
@@ -262,9 +347,10 @@ def main() -> None:
     _log(f"Railway: {len(railway)} rows in window")
 
     _log("fetching Supabase logs...")
-    supabase = supabase_logs(hours)
-    _log("Supabase totals: "
-         + ", ".join(f"{k}={len(v)}" for k, v in supabase.items()))
+    supabase = supabase_logs(hours, raw=raw)
+    _log("Supabase totals: " + ", ".join(
+        f"{k}={v.get('rows') if isinstance(v, dict) else len(v)}"
+        for k, v in supabase.items()))
 
     if raw:
         # Full unaggregated rows — for debugging only; can be millions of lines.

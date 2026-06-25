@@ -217,7 +217,13 @@ def build_digest(railway: list, supabase: dict, period_hours: float) -> dict:
         "railway": _railway_digest(railway, start, bucket),
         "supabase": {},
     }
-    for dataset, rows in supabase.items():
-        digester = _SUPABASE_DIGESTERS.get(dataset, _generic_digest)
-        digest["supabase"][dataset] = digester(rows, start, bucket)
+    for dataset, value in supabase.items():
+        # High-volume datasets arrive already aggregated server-side (a dict);
+        # low-volume ones arrive as raw row lists to digest here. (--raw mode
+        # bypasses build_digest entirely, so values are always one or the other.)
+        if isinstance(value, dict):
+            digest["supabase"][dataset] = value
+        else:
+            digester = _SUPABASE_DIGESTERS.get(dataset, _generic_digest)
+            digest["supabase"][dataset] = digester(value, start, bucket)
     return digest

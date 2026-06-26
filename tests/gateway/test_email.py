@@ -1649,10 +1649,12 @@ class TestOAuthGraphSend(unittest.TestCase):
     }
 
     def setUp(self):
-        # Token cache is module-global and keyed by tenant:client_id; clear it so
-        # each test exercises the real token round-trip rather than a cache hit.
+        # Token cache + rotated-refresh override are module-global and keyed by
+        # tenant:client_id; clear both so each test exercises the real token
+        # round-trip (and doesn't inherit a refresh token from a prior test).
         import plugins.platforms.email.adapter as email_mod
         email_mod._GRAPH_TOKEN_CACHE.clear()
+        email_mod._GRAPH_REFRESH_OVERRIDE.clear()
 
     def _mock_post(self, send_status=202):
         """requests.post stub: token endpoint -> 200+token, sendMail -> 202."""
@@ -1833,6 +1835,86 @@ class TestOAuthGraphSend(unittest.TestCase):
         # Token fetched once and reused; two messages sent.
         self.assertEqual(len(token_calls), 1)
         self.assertEqual(len(send_calls), 2)
+
+    def test_refresh_token_uses_delegated_grant(self):
+        """With EMAIL_OAUTH_REFRESH_TOKEN set, the token request must use the
+        delegated refresh_token grant (no admin consent needed), and a rotated
+        refresh token in the response is captured for reuse."""
+        import asyncio
+        import plugins.platforms.email.adapter as email_mod
+        email_mod._GRAPH_REFRESH_OVERRIDE.clear()
+
+        captured = []
+
+        def _post(url, **kwargs):
+            captured.append((url, kwargs))
+            resp = MagicMock()
+            if url.endswith("/token"):
+                resp.status_code = 200
+                resp.json.return_value = {
+                    "access_token": "fake-token",
+                    "expires_in": 3600,
+                    "refresh_token": "rotated-refresh",
+                }
+            else:
+                resp.status_code = 202
+                resp.text = ""
+            return resp
+
+        # The refresh token is read from env at send time, so it must stay set
+        # for the duration of the send (not just during construction).
+        env = dict(self.OAUTH_ENV, EMAIL_OAUTH_REFRESH_TOKEN="init-refresh")
+        with patch.dict(os.environ, env, clear=False), \
+             patch("requests.post", side_effect=_post):
+            adapter = self._make_adapter({"EMAIL_OAUTH_REFRESH_TOKEN": "init-refresh"})
+            result = asyncio.run(adapter.send("user@test.com", "Hi"))
+
+        self.assertTrue(result.success)
+        token_call = [c for c in captured if c[0].endswith("/token")][0]
+        self.assertEqual(token_call[1]["data"]["grant_type"], "refresh_token")
+        self.assertEqual(token_call[1]["data"]["refresh_token"], "init-refresh")
+        # Rotated refresh token captured in the module override.
+        self.assertEqual(
+            email_mod._GRAPH_REFRESH_OVERRIDE.get("tenant-123:client-abc"),
+            "rotated-refresh",
+        )
+        email_mod._GRAPH_REFRESH_OVERRIDE.clear()
+
+    def test_refresh_token_retries_without_secret_for_public_client(self):
+        """A public-client app rejects the secret (AADSTS700025); the token
+        fetch must retry without it."""
+        import asyncio
+        import plugins.platforms.email.adapter as email_mod
+        email_mod._GRAPH_REFRESH_OVERRIDE.clear()
+
+        token_posts = []
+
+        def _post(url, **kwargs):
+            resp = MagicMock()
+            if url.endswith("/token"):
+                token_posts.append(kwargs["data"])
+                if "client_secret" in kwargs["data"]:
+                    resp.status_code = 400
+                    resp.text = '{"error":"invalid_request","error_codes":[700025]} AADSTS700025'
+                else:
+                    resp.status_code = 200
+                    resp.json.return_value = {"access_token": "tok", "expires_in": 3600}
+            else:
+                resp.status_code = 202
+                resp.text = ""
+            return resp
+
+        env = dict(self.OAUTH_ENV, EMAIL_OAUTH_REFRESH_TOKEN="init-refresh")
+        with patch.dict(os.environ, env, clear=False), \
+             patch("requests.post", side_effect=_post):
+            adapter = self._make_adapter({"EMAIL_OAUTH_REFRESH_TOKEN": "init-refresh"})
+            result = asyncio.run(adapter.send("user@test.com", "Hi"))
+
+        self.assertTrue(result.success)
+        # First attempt included the secret; retry dropped it.
+        self.assertIn("client_secret", token_posts[0])
+        self.assertNotIn("client_secret", token_posts[1])
+        email_mod._GRAPH_REFRESH_OVERRIDE.clear()
 
     def test_standalone_send_uses_graph(self):
         import asyncio

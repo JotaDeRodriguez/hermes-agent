@@ -20,16 +20,22 @@ Environment variables:
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 
     OAuth2 / Microsoft Graph (outbound only):
-    EMAIL_OAUTH_TENANT_ID     — Azure AD tenant id (client-credentials flow)
+    EMAIL_OAUTH_TENANT_ID     — Azure AD tenant id
     EMAIL_OAUTH_CLIENT_ID     — Azure app registration client id
     EMAIL_OAUTH_CLIENT_SECRET — Azure app client secret
+    EMAIL_OAUTH_REFRESH_TOKEN — Optional. Delegated refresh token for the
+                                mailbox owner (scope: offline_access Mail.Send).
+                                When set, sends use the delegated refresh-token
+                                grant (no admin consent needed); when absent,
+                                the app-only client-credentials grant is used
+                                (needs admin-consented application Mail.Send).
 
-    When all three EMAIL_OAUTH_* vars are set, every outbound message is sent
-    via the Microsoft Graph ``sendMail`` API (app-only client-credentials flow)
-    instead of SMTP basic auth. This is required where the mailbox provider
-    (M365 Conditional Access) blocks legacy/basic SMTP auth from the deployment
-    location but permits OAuth2. SMTP basic auth remains the fallback when the
-    OAuth vars are absent. IMAP receiving still uses basic auth.
+    When the three required EMAIL_OAUTH_* vars are set, every outbound message
+    is sent via the Microsoft Graph ``sendMail`` API instead of SMTP basic auth.
+    This is required where the mailbox provider (M365 Conditional Access) blocks
+    legacy/basic SMTP auth from the deployment location but permits OAuth2. SMTP
+    basic auth remains the fallback when the OAuth vars are absent. IMAP
+    receiving still uses basic auth.
 """
 
 import asyncio
@@ -197,7 +203,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# OAuth2 / Microsoft Graph outbound (app-only client-credentials flow).
+# OAuth2 / Microsoft Graph outbound. Two flows, auto-selected:
+#
+#   1. Delegated (preferred where admin consent is unavailable): set
+#      EMAIL_OAUTH_REFRESH_TOKEN to a refresh token minted for the mailbox
+#      owner (scope: offline_access + Mail.Send). We redeem it for short-lived
+#      access tokens. Needs only the *delegated* Mail.Send + offline_access
+#      grants, which a user can self-consent — no Global Admin required.
+#   2. App-only client-credentials (no refresh token set): requires the
+#      *application* Mail.Send permission with admin consent.
 #
 # Why this exists: M365 Conditional Access blocks SMTP *basic auth* from some
 # deployment locations (e.g. cloud datacenters) with "535 5.7.139 ...basic
@@ -213,6 +227,11 @@ GRAPH_HTTP_TIMEOUT = 30
 # Tokens last ~1h; caching avoids a token round-trip on every send. Guarded by
 # a lock because sends run in executor threads.
 _GRAPH_TOKEN_CACHE: Dict[str, Tuple[str, float]] = {}
+# Latest rotated refresh token (Azure returns a fresh one on each redemption),
+# keyed by "tenant:client_id". In-memory only: survives within a process so
+# rotation doesn't break long-running sends; on restart we fall back to the
+# EMAIL_OAUTH_REFRESH_TOKEN env value (valid for ~90 days of inactivity).
+_GRAPH_REFRESH_OVERRIDE: Dict[str, str] = {}
 _GRAPH_TOKEN_LOCK = threading.Lock()
 
 
@@ -228,26 +247,53 @@ def _oauth_credentials() -> Optional[Tuple[str, str, str]]:
 
 
 def _graph_access_token(tenant: str, client_id: str, client_secret: str) -> str:
-    """Fetch (and cache) an app-only Graph access token via client-credentials."""
+    """Fetch (and cache) a Graph access token.
+
+    Uses the delegated refresh-token grant when EMAIL_OAUTH_REFRESH_TOKEN is
+    set, else the app-only client-credentials grant.
+    """
     import requests  # core dep; imported lazily so module import never hard-fails
 
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
     cache_key = f"{tenant}:{client_id}"
     now = time.time()
     with _GRAPH_TOKEN_LOCK:
         cached = _GRAPH_TOKEN_CACHE.get(cache_key)
         if cached and cached[1] - 60 > now:
             return cached[0]
+        refresh_token = (
+            _GRAPH_REFRESH_OVERRIDE.get(cache_key)
+            or os.getenv("EMAIL_OAUTH_REFRESH_TOKEN", "").strip()
+        )
 
-    resp = requests.post(
-        f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
-        data={
-            "grant_type": "client_credentials",
+    if refresh_token:
+        base = {
+            "grant_type": "refresh_token",
             "client_id": client_id,
-            "client_secret": client_secret,
+            "refresh_token": refresh_token,
             "scope": GRAPH_SCOPE,
-        },
-        timeout=GRAPH_HTTP_TIMEOUT,
-    )
+        }
+        # Try as a confidential client (with secret) first — matches tokens
+        # minted via ROPC/auth-code. If the app is registered as a public
+        # client the secret is rejected (AADSTS700025); retry without it.
+        resp = requests.post(
+            token_url, data={**base, "client_secret": client_secret},
+            timeout=GRAPH_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200 and "AADSTS700025" in resp.text:
+            resp = requests.post(token_url, data=base, timeout=GRAPH_HTTP_TIMEOUT)
+    else:
+        resp = requests.post(
+            token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": GRAPH_SCOPE,
+            },
+            timeout=GRAPH_HTTP_TIMEOUT,
+        )
+
     if resp.status_code != 200:
         raise RuntimeError(
             f"OAuth token request failed ({resp.status_code}): {resp.text[:300]}"
@@ -257,8 +303,11 @@ def _graph_access_token(tenant: str, client_id: str, client_secret: str) -> str:
     if not token:
         raise RuntimeError(f"OAuth token response missing access_token: {payload}")
     expires_in = int(payload.get("expires_in", 3600))
+    rotated = payload.get("refresh_token")
     with _GRAPH_TOKEN_LOCK:
         _GRAPH_TOKEN_CACHE[cache_key] = (token, now + expires_in)
+        if rotated:
+            _GRAPH_REFRESH_OVERRIDE[cache_key] = rotated
     return token
 
 

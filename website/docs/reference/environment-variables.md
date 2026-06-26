@@ -338,6 +338,9 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `EMAIL_IMAP_PORT` | IMAP port |
 | `EMAIL_SMTP_HOST` | SMTP hostname for the email adapter |
 | `EMAIL_SMTP_PORT` | SMTP port |
+| `EMAIL_OAUTH_TENANT_ID` | Azure AD tenant id — enables OAuth2/Microsoft Graph outbound (client-credentials) instead of SMTP basic auth |
+| `EMAIL_OAUTH_CLIENT_ID` | Azure app registration client id (required with `EMAIL_OAUTH_TENANT_ID`) |
+| `EMAIL_OAUTH_CLIENT_SECRET` | Azure app client secret (required with `EMAIL_OAUTH_TENANT_ID`) |
 | `EMAIL_ALLOWED_USERS` | Comma-separated email addresses allowed to message the bot |
 | `EMAIL_HOME_ADDRESS` | Default recipient for proactive email delivery |
 | `EMAIL_HOME_ADDRESS_NAME` | Display name for the email home target |

@@ -1783,18 +1783,30 @@ class TestOAuthGraphSend(unittest.TestCase):
         adapter = self._make_adapter()
         post, calls = self._mock_post()
 
+        # Graph receive mode (OAuth, no IMAP) polls the inbox over Graph, so the
+        # backlog-skip issues a Graph GET — return an empty unread list for it.
+        def _get(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"value": []}
+            return resp
+
         with patch("requests.post", side_effect=post), \
+             patch("requests.get", side_effect=_get), \
              patch("imaplib.IMAP4_SSL") as mock_imap, \
              patch("smtplib.SMTP") as mock_smtp:
             result = asyncio.run(adapter.connect())
 
         self.assertTrue(result)
         self.assertTrue(adapter._running)
-        self.assertIsNone(adapter._poll_task)  # SMTP-only (no IMAP host)
+        # Graph (OAuth without IMAP) is now a receive path: a poll task runs.
+        self.assertIsNotNone(adapter._poll_task)
         mock_imap.assert_not_called()
         mock_smtp.assert_not_called()
         self.assertTrue(any(c[0].endswith("/token") for c in calls))
+        # Cleanup
         adapter._running = False
+        adapter._poll_task.cancel()
 
     def test_connect_fails_when_token_request_fails(self):
         import asyncio
@@ -1941,6 +1953,292 @@ class TestOAuthGraphSend(unittest.TestCase):
         self.assertEqual(
             message["toRecipients"][0]["emailAddress"]["address"], "user@test.com"
         )
+
+
+class TestOAuthGraphReceive(unittest.TestCase):
+    """Microsoft Graph inbound polling (used when EMAIL_OAUTH_* set + no IMAP).
+
+    M365 blocks IMAP basic auth from the deployment location while permitting
+    OAuth2, so inbound must read the inbox over Graph. Verifies the fetch
+    produces the same dict shape _dispatch_message expects, marks messages read,
+    and that connect() skips the existing backlog.
+    """
+
+    OAUTH_ENV = {
+        "EMAIL_ADDRESS": "innovacion@lpsgrupo.com",
+        "EMAIL_IMAP_HOST": "",
+        "EMAIL_OAUTH_TENANT_ID": "tenant-123",
+        "EMAIL_OAUTH_CLIENT_ID": "client-abc",
+        "EMAIL_OAUTH_CLIENT_SECRET": "shh-secret",
+    }
+
+    def setUp(self):
+        import plugins.platforms.email.adapter as email_mod
+        email_mod._GRAPH_TOKEN_CACHE.clear()
+        email_mod._GRAPH_REFRESH_OVERRIDE.clear()
+
+    def _make_adapter(self, extra_env=None):
+        from gateway.config import PlatformConfig
+        env = dict(self.OAUTH_ENV)
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env, clear=False):
+            from plugins.platforms.email.adapter import EmailAdapter
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    @staticmethod
+    def _message(**overrides):
+        msg = {
+            "id": "AAMkAGItgraph-id-1",
+            "subject": "Quarterly numbers",
+            "from": {"emailAddress": {"name": "Jane Doe", "address": "jane@lpsgrupo.com"}},
+            "receivedDateTime": "2026-06-26T10:00:00Z",
+            "internetMessageId": "<orig-123@lpsgrupo.com>",
+            "bodyPreview": "preview text",
+            "body": {"contentType": "text", "content": "Hello from Graph"},
+            "hasAttachments": False,
+            "conversationId": "conv-1",
+        }
+        msg.update(overrides)
+        return msg
+
+    def _graph_stub(self, messages, attachments=None):
+        """Return (get, patch, calls) stubs for requests.get/.post/.patch.
+
+        ``get`` answers the inbox-list query with ``messages`` and any
+        ``.../attachments`` query with ``attachments``. ``post`` answers the
+        token endpoint. ``patch`` records mark-read calls.
+        """
+        calls = {"get": [], "patch": []}
+
+        def _get(url, **kwargs):
+            calls["get"].append((url, kwargs))
+            resp = MagicMock()
+            resp.status_code = 200
+            if "/attachments" in url:
+                resp.json.return_value = {"value": attachments or []}
+            else:
+                resp.json.return_value = {"value": messages}
+            return resp
+
+        def _post(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"access_token": "fake-token", "expires_in": 3600}
+            return resp
+
+        def _patch(url, **kwargs):
+            calls["patch"].append((url, kwargs))
+            resp = MagicMock()
+            resp.status_code = 200
+            return resp
+
+        return _get, _post, _patch, calls
+
+    def test_check_inbox_uses_graph_not_imap(self):
+        """With OAuth and no IMAP, _check_inbox routes through the Graph fetch."""
+        import asyncio
+        adapter = self._make_adapter()
+        get, post, patch_fn, _ = self._graph_stub([self._message()])
+        dispatched = []
+
+        async def capture(msg_data):
+            dispatched.append(msg_data)
+
+        adapter._dispatch_message = capture
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn), \
+             patch("imaplib.IMAP4_SSL") as mock_imap:
+            asyncio.run(adapter._check_inbox())
+
+        mock_imap.assert_not_called()
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0]["sender_addr"], "jane@lpsgrupo.com")
+        self.assertEqual(dispatched[0]["subject"], "Quarterly numbers")
+
+    def test_fetch_graph_returns_dispatch_shape(self):
+        """Fetched dict carries every key _dispatch_message reads."""
+        adapter = self._make_adapter()
+        get, post, patch_fn, _ = self._graph_stub([self._message()])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertEqual(len(results), 1)
+        msg = results[0]
+        for key in ("uid", "sender_addr", "sender_name", "subject",
+                    "message_id", "in_reply_to", "body", "attachments", "date"):
+            self.assertIn(key, msg)
+        self.assertEqual(msg["sender_addr"], "jane@lpsgrupo.com")
+        self.assertEqual(msg["sender_name"], "Jane Doe")
+        self.assertEqual(msg["message_id"], "<orig-123@lpsgrupo.com>")
+        self.assertEqual(msg["body"], "Hello from Graph")
+        self.assertEqual(msg["date"], "2026-06-26T10:00:00Z")
+        self.assertEqual(msg["attachments"], [])
+
+    def test_fetch_graph_strips_html_body(self):
+        adapter = self._make_adapter()
+        html_msg = self._message(
+            body={"contentType": "html", "content": "<p>Hello <b>world</b></p>"}
+        )
+        get, post, patch_fn, _ = self._graph_stub([html_msg])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertIn("Hello", results[0]["body"])
+        self.assertNotIn("<p>", results[0]["body"])
+        self.assertNotIn("<b>", results[0]["body"])
+
+    def test_fetch_graph_marks_messages_read(self):
+        """Each processed message must be PATCHed isRead=true so it isn't re-polled."""
+        adapter = self._make_adapter()
+        get, post, patch_fn, calls = self._graph_stub([self._message(id="msg-abc")])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            adapter._fetch_new_messages_graph()
+
+        self.assertEqual(len(calls["patch"]), 1)
+        url, kwargs = calls["patch"][0]
+        self.assertIn("/messages/msg-abc", url)
+        self.assertEqual(kwargs["json"], {"isRead": True})
+
+    def test_fetch_graph_skips_seen_uids(self):
+        """A message id already in seen_uids is not returned again."""
+        adapter = self._make_adapter()
+        adapter._seen_uids = {"msg-dup"}
+        get, post, patch_fn, _ = self._graph_stub([self._message(id="msg-dup")])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertEqual(results, [])
+
+    def test_fetch_graph_skips_automated_sender(self):
+        adapter = self._make_adapter()
+        # "from" is a Python keyword, so build the noreply sender by mutation.
+        noreply = self._message()
+        noreply["from"]["emailAddress"]["address"] = "noreply@service.com"
+        get, post, patch_fn, _ = self._graph_stub([noreply])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertEqual(results, [])
+
+    def test_fetch_graph_decodes_attachments(self):
+        """File attachments are base64-decoded and cached like the IMAP path."""
+        import base64
+        adapter = self._make_adapter()
+        msg = self._message(hasAttachments=True)
+        att = {
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": "report.pdf",
+            "contentType": "application/pdf",
+            "contentBytes": base64.b64encode(b"%PDF-1.4 data").decode("ascii"),
+        }
+        get, post, patch_fn, _ = self._graph_stub([msg], attachments=[att])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn), \
+             patch("plugins.platforms.email.adapter.cache_document_from_bytes",
+                   return_value="/tmp/report.pdf") as mock_cache:
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertEqual(len(results[0]["attachments"]), 1)
+        a = results[0]["attachments"][0]
+        self.assertEqual(a["type"], "document")
+        self.assertEqual(a["filename"], "report.pdf")
+        self.assertEqual(a["path"], "/tmp/report.pdf")
+        mock_cache.assert_called_once()
+        self.assertEqual(mock_cache.call_args[0][0], b"%PDF-1.4 data")
+
+    def test_fetch_graph_respects_skip_attachments(self):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, self.OAUTH_ENV, clear=False):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(
+                PlatformConfig(enabled=True, extra={"skip_attachments": True})
+            )
+        msg = self._message(hasAttachments=True)
+        get, post, patch_fn, calls = self._graph_stub([msg], attachments=[{
+            "@odata.type": "#microsoft.graph.fileAttachment",
+            "name": "x.pdf", "contentType": "application/pdf", "contentBytes": "AAAA",
+        }])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertEqual(results[0]["attachments"], [])
+        # No attachments GET should have been issued.
+        self.assertFalse(any("/attachments" in u for u, _ in calls["get"]))
+
+    def test_fetch_graph_query_targets_inbox_unread(self):
+        adapter = self._make_adapter()
+        get, post, patch_fn, calls = self._graph_stub([])
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn):
+            adapter._fetch_new_messages_graph()
+
+        url, kwargs = calls["get"][0]
+        self.assertIn("innovacion%40lpsgrupo.com", url)
+        self.assertIn("/mailFolders/inbox/messages", url)
+        params = kwargs["params"]
+        self.assertEqual(params["$filter"], "isRead eq false")
+        self.assertEqual(params["$orderby"], "receivedDateTime asc")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer fake-token")
+
+    def test_fetch_graph_handles_error(self):
+        """A Graph error returns an empty list rather than raising."""
+        adapter = self._make_adapter()
+
+        with patch("requests.get", side_effect=Exception("network down")), \
+             patch("requests.post", side_effect=Exception("network down")):
+            results = adapter._fetch_new_messages_graph()
+
+        self.assertEqual(results, [])
+
+    def test_connect_skips_existing_unread_backlog(self):
+        """connect() marks the existing unread backlog read so the gateway only
+        replies to mail that arrives after startup."""
+        import asyncio
+        adapter = self._make_adapter()
+        backlog = [self._message(id="old-1"), self._message(id="old-2")]
+        get, post, patch_fn, calls = self._graph_stub(backlog)
+
+        with patch("requests.get", side_effect=get), \
+             patch("requests.post", side_effect=post), \
+             patch("requests.patch", side_effect=patch_fn), \
+             patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(adapter.connect())
+
+        self.assertTrue(result)
+        mock_smtp.assert_not_called()
+        # Both backlog ids recorded as seen and marked read.
+        self.assertIn("old-1", adapter._seen_uids)
+        self.assertIn("old-2", adapter._seen_uids)
+        self.assertEqual(len(calls["patch"]), 2)
+        # Cleanup
+        adapter._running = False
+        if adapter._poll_task:
+            adapter._poll_task.cancel()
 
 
 if __name__ == "__main__":

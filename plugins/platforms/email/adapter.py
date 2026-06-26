@@ -2,8 +2,12 @@
 Email platform adapter for the Hermes gateway.
 
 Allows users to interact with Hermes by sending emails.
-Uses IMAP to receive and SMTP to send messages. If IMAP is not configured,
-the adapter runs in SMTP-only mode for outbound delivery.
+Uses IMAP to receive and SMTP to send messages. When OAuth2/Microsoft Graph is
+configured (EMAIL_OAUTH_* set) and no IMAP host is given, the adapter receives
+*and* sends over Graph instead — required where M365 Conditional Access blocks
+SMTP/IMAP basic auth from the deployment location but permits OAuth2. If neither
+IMAP nor OAuth is configured, the adapter runs in SMTP-only mode for outbound
+delivery (no polling).
 
 Environment variables:
     EMAIL_IMAP_HOST     — Optional IMAP server host (e.g., imap.gmail.com)
@@ -19,7 +23,7 @@ Environment variables:
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 
-    OAuth2 / Microsoft Graph (outbound only):
+    OAuth2 / Microsoft Graph (outbound send + inbound polling):
     EMAIL_OAUTH_TENANT_ID     — Azure AD tenant id
     EMAIL_OAUTH_CLIENT_ID     — Azure app registration client id
     EMAIL_OAUTH_CLIENT_SECRET — Azure app client secret
@@ -698,8 +702,14 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("[Email] IMAP connection failed: %s", e)
                 return False
+        elif self._oauth:
+            logger.info(
+                "[Email] IMAP host not configured; receiving via Microsoft Graph polling."
+            )
         else:
-            logger.info("[Email] IMAP host not configured; starting in SMTP-only mode.")
+            logger.info(
+                "[Email] IMAP host not configured; starting in SMTP-only mode (no polling)."
+            )
 
         if self._oauth:
             # Validate the OAuth path by acquiring a Graph token (basic-auth SMTP
@@ -711,6 +721,25 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.error("[Email] OAuth2/Graph token request failed: %s", e)
                 return False
+            # Graph inbound: skip the existing unread backlog so a freshly
+            # started gateway only replies to mail that arrives afterwards
+            # (mirrors the IMAP branch above marking existing messages seen).
+            # Only when Graph is the receive path — if IMAP is configured it
+            # owns receiving and already pre-seeded seen_uids above.
+            if not self._imap_host:
+                try:
+                    loop = asyncio.get_running_loop()
+                    skipped = await loop.run_in_executor(
+                        None, self._graph_skip_existing_unread
+                    )
+                    logger.info(
+                        "[Email] Graph inbox poll enabled. %d existing unread "
+                        "messages skipped.", skipped,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Email] Could not pre-skip existing unread via Graph: %s", e
+                    )
         else:
             try:
                 # Test SMTP connection
@@ -725,7 +754,9 @@ class EmailAdapter(BasePlatformAdapter):
                 return False
 
         self._running = True
-        if self._imap_host:
+        # Poll for inbound when a receive path exists: IMAP, or Graph (OAuth
+        # without IMAP). SMTP-only with no OAuth has no inbox to read.
+        if self._imap_host or self._oauth:
             self._poll_task = asyncio.create_task(self._poll_loop())
             print(f"[Email] Connected as {self._address}")
         else:
@@ -746,7 +777,7 @@ class EmailAdapter(BasePlatformAdapter):
         logger.info("[Email] Disconnected.")
 
     async def _poll_loop(self) -> None:
-        """Poll IMAP for new messages at regular intervals."""
+        """Poll the inbox (IMAP or Graph) for new messages at regular intervals."""
         while self._running:
             try:
                 await self._check_inbox()
@@ -757,12 +788,247 @@ class EmailAdapter(BasePlatformAdapter):
             await asyncio.sleep(self._poll_interval)
 
     async def _check_inbox(self) -> None:
-        """Check INBOX for unseen messages and dispatch them."""
-        # Run IMAP operations in a thread to avoid blocking the event loop
+        """Check INBOX for unseen messages and dispatch them.
+
+        Receive transport is chosen by config: Microsoft Graph when OAuth is
+        configured and no IMAP host is set (the M365/Railway case where basic
+        auth is blocked), otherwise IMAP basic auth.
+        """
+        # Run the (blocking) fetch in a thread to avoid blocking the event loop
         loop = asyncio.get_running_loop()
-        messages = await loop.run_in_executor(None, self._fetch_new_messages)
+        fetch = (
+            self._fetch_new_messages_graph
+            if self._oauth and not self._imap_host
+            else self._fetch_new_messages
+        )
+        messages = await loop.run_in_executor(None, fetch)
         for msg_data in messages:
             await self._dispatch_message(msg_data)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Microsoft Graph inbound (used when OAuth is configured and IMAP is not).
+    # Mirrors the IMAP receive path: unread inbox messages are read, recorded in
+    # seen_uids, and marked read on the server (the Graph analog of IMAP setting
+    # \Seen on an RFC822 fetch) so they are not processed twice. The same
+    # delegated refresh-token grant that authorizes sendMail also grants inbox
+    # read access (Mail.ReadWrite), so no extra consent is needed.
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _graph_get(
+        self, url: str, params: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """Authenticated Graph GET returning parsed JSON. Runs in executor
+        thread. Raises RuntimeError on a non-200 response."""
+        import requests  # core dep; lazy import keeps module import resilient
+
+        token = _graph_access_token(*self._oauth)
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=GRAPH_HTTP_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Graph GET failed ({resp.status_code}): {resp.text[:300]}"
+            )
+        return resp.json()
+
+    def _graph_mark_read(self, msg_id: str) -> None:
+        """Best-effort: mark a Graph message read so the next poll skips it.
+
+        A failure is non-fatal — ``seen_uids`` still guards against in-process
+        repeats, and connect() re-skips any still-unread backlog on restart.
+        """
+        import requests
+
+        try:
+            token = _graph_access_token(*self._oauth)
+            resp = requests.patch(
+                f"{GRAPH_BASE_URL}/users/{quote(self._address)}/messages/{msg_id}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+                json={"isRead": True},
+                timeout=GRAPH_HTTP_TIMEOUT,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "[Email] Graph mark-read failed (%s): %s",
+                    resp.status_code, resp.text[:200],
+                )
+        except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning("[Email] Graph mark-read error for %s: %s", msg_id, e)
+
+    def _graph_attachments(self, msg_id: str) -> List[Dict[str, Any]]:
+        """Fetch and cache a Graph message's file attachments.
+
+        Returns the same ``{path, filename, type, media_type}`` dicts as
+        ``_extract_attachments`` (so _dispatch_message needs no changes), using
+        the same image/document caching logic. Honors ``self._skip_attachments``.
+        Best-effort: any failure yields no attachments rather than dropping the
+        whole message.
+        """
+        if self._skip_attachments:
+            return []
+        attachments: List[Dict[str, Any]] = []
+        try:
+            url = (
+                f"{GRAPH_BASE_URL}/users/{quote(self._address)}"
+                f"/messages/{msg_id}/attachments"
+            )
+            data = self._graph_get(url)
+            for att in data.get("value", []):
+                if att.get("@odata.type") != "#microsoft.graph.fileAttachment":
+                    continue
+                content_b64 = att.get("contentBytes")
+                if not content_b64:
+                    continue
+                try:
+                    payload = base64.b64decode(content_b64)
+                except Exception:
+                    logger.debug("[Email] Skipping attachment with bad base64")
+                    continue
+
+                filename = att.get("name") or "attachment.bin"
+                content_type = att.get("contentType") or "application/octet-stream"
+                ext = Path(filename).suffix.lower()
+                if ext in _IMAGE_EXTS:
+                    try:
+                        cached_path = cache_image_from_bytes(payload, ext)
+                    except ValueError:
+                        logger.debug(
+                            "Skipping non-image attachment %s (invalid magic bytes)",
+                            filename,
+                        )
+                        continue
+                    attachments.append({
+                        "path": cached_path,
+                        "filename": filename,
+                        "type": "image",
+                        "media_type": content_type,
+                    })
+                else:
+                    cached_path = cache_document_from_bytes(payload, filename)
+                    attachments.append({
+                        "path": cached_path,
+                        "filename": filename,
+                        "type": "document",
+                        "media_type": content_type,
+                    })
+        except Exception as e:  # noqa: BLE001 — attachments are best-effort
+            logger.warning(
+                "[Email] Failed to fetch Graph attachments for %s: %s", msg_id, e
+            )
+        return attachments
+
+    def _fetch_new_messages_graph(self) -> List[Dict[str, Any]]:
+        """Fetch new (unread) inbox messages via Microsoft Graph.
+
+        Returns the SAME list-of-dicts shape as ``_fetch_new_messages`` so
+        ``_dispatch_message`` needs no changes. Runs in an executor thread.
+        """
+        results: List[Dict[str, Any]] = []
+        try:
+            base = (
+                f"{GRAPH_BASE_URL}/users/{quote(self._address)}"
+                f"/mailFolders/inbox/messages"
+            )
+            params = {
+                "$filter": "isRead eq false",
+                "$top": "25",
+                "$orderby": "receivedDateTime asc",
+                "$select": (
+                    "id,subject,from,receivedDateTime,internetMessageId,"
+                    "bodyPreview,body,hasAttachments,conversationId"
+                ),
+            }
+            data = self._graph_get(base, params=params)
+            for message in data.get("value", []):
+                msg_id = message.get("id")
+                if not msg_id or msg_id in self._seen_uids:
+                    continue
+                self._seen_uids.add(msg_id)
+                if len(self._seen_uids) > self._seen_uids_max:
+                    self._trim_seen_uids()
+
+                sender = (message.get("from") or {}).get("emailAddress") or {}
+                sender_addr = (sender.get("address") or "").strip().lower()
+                sender_name = sender.get("name") or ""
+
+                # Skip automated/noreply senders before any heavier work
+                # (parity with the IMAP path's _is_automated_sender gate).
+                if sender_addr and _is_automated_sender(sender_addr, {}):
+                    logger.debug("[Email] Skipping automated sender: %s", sender_addr)
+                    self._graph_mark_read(msg_id)
+                    continue
+
+                subject = message.get("subject") or "(no subject)"
+                body_obj = message.get("body") or {}
+                body = body_obj.get("content", "") or ""
+                if (body_obj.get("contentType") or "").lower() == "html":
+                    body = _strip_html(body)
+                if not body:
+                    body = message.get("bodyPreview", "") or ""
+
+                attachments = (
+                    self._graph_attachments(msg_id)
+                    if message.get("hasAttachments")
+                    else []
+                )
+
+                results.append({
+                    "uid": msg_id,
+                    "sender_addr": sender_addr,
+                    "sender_name": sender_name,
+                    "subject": subject,
+                    "message_id": message.get("internetMessageId", ""),
+                    # in_reply_to needs internetMessageHeaders to populate;
+                    # replies thread by the Re: subject instead (see _graph_send).
+                    "in_reply_to": "",
+                    "body": body,
+                    "attachments": attachments,
+                    "date": message.get("receivedDateTime", ""),
+                })
+                # Mark read so the next poll's isRead-eq-false query skips it.
+                # seen_uids is the in-process guard; this is the durable one.
+                self._graph_mark_read(msg_id)
+        except Exception as e:
+            logger.error("[Email] Graph fetch error: %s", e)
+        return results
+
+    def _graph_skip_existing_unread(self) -> int:
+        """Mark all currently-unread inbox messages read (recording their ids),
+        so a freshly-started gateway only replies to mail that arrives after it
+        comes up. The Graph analog of connect()'s IMAP path adding existing UIDs
+        to ``seen_uids``. Runs synchronously in an executor thread; pagination is
+        bounded to avoid a pathological loop on a huge backlog.
+        """
+        count = 0
+        url: Optional[str] = (
+            f"{GRAPH_BASE_URL}/users/{quote(self._address)}"
+            f"/mailFolders/inbox/messages"
+        )
+        params: Optional[Dict[str, str]] = {
+            "$filter": "isRead eq false",
+            "$top": "50",
+            "$select": "id",
+        }
+        for _ in range(40):  # cap at ~2000 messages
+            data = self._graph_get(url, params=params)
+            for message in data.get("value", []):
+                mid = message.get("id")
+                if not mid:
+                    continue
+                self._seen_uids.add(mid)
+                self._graph_mark_read(mid)
+                count += 1
+            url = data.get("@odata.nextLink")
+            params = None  # nextLink already encodes the query
+            if not url:
+                break
+        return count
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""

@@ -1484,9 +1484,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     # Email
     email_addr = os.getenv("EMAIL_ADDRESS")
-    email_pwd = os.getenv("EMAIL_PASSWORD")
+    email_pwd = os.getenv("EMAIL_SMTP_PASSWORD") or os.getenv("SMTP_PASSWORD") or os.getenv("EMAIL_PASSWORD")
     email_imap = os.getenv("EMAIL_IMAP_HOST")
     email_smtp = os.getenv("EMAIL_SMTP_HOST")
+    email_smtp_username = os.getenv("EMAIL_SMTP_USERNAME") or os.getenv("SMTP_USERNAME")
+    email_from = os.getenv("EMAIL_FROM") or os.getenv("MAIL_FROM")
     if all([email_addr, email_pwd, email_smtp]):
         if Platform.EMAIL not in config.platforms:
             config.platforms[Platform.EMAIL] = PlatformConfig()
@@ -1497,6 +1499,10 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         }
         if email_imap:
             extra["imap_host"] = email_imap
+        if email_smtp_username:
+            extra["smtp_username"] = email_smtp_username
+        if email_from:
+            extra["from_address"] = email_from
         config.platforms[Platform.EMAIL].extra.update(extra)
     email_home = os.getenv("EMAIL_HOME_ADDRESS")
     if email_home and Platform.EMAIL in config.platforms:

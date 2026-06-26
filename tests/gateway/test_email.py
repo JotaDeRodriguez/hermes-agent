@@ -44,7 +44,9 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "LOCALAPPDATA": "C:\\tmp",
         "EMAIL_ADDRESS": "hermes@test.com",
-        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_PASSWORD": "secret",
+        "EMAIL_SMTP_USERNAME": "smtp-user@test.com",
+        "EMAIL_FROM": "from@test.com",
         "EMAIL_SMTP_HOST": "smtp.test.com",
     }, clear=True)
     def test_email_config_loaded_from_smtp_only_env(self):
@@ -55,6 +57,8 @@ class TestConfigEnvOverrides(unittest.TestCase):
         self.assertTrue(config.platforms[Platform.EMAIL].enabled)
         self.assertEqual(config.platforms[Platform.EMAIL].extra["address"], "hermes@test.com")
         self.assertEqual(config.platforms[Platform.EMAIL].extra["smtp_host"], "smtp.test.com")
+        self.assertEqual(config.platforms[Platform.EMAIL].extra["smtp_username"], "smtp-user@test.com")
+        self.assertEqual(config.platforms[Platform.EMAIL].extra["from_address"], "from@test.com")
         self.assertNotIn("imap_host", config.platforms[Platform.EMAIL].extra)
 
     @patch.dict(os.environ, {
@@ -94,7 +98,7 @@ class TestCheckRequirements(unittest.TestCase):
 
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "a@b.com",
-        "EMAIL_PASSWORD": "pw",
+        "SMTP_PASSWORD": "pw",
         "EMAIL_SMTP_HOST": "smtp.b.com",
     }, clear=True)
     def test_requirements_met_without_imap(self):
@@ -728,6 +732,34 @@ class TestSendMethods(unittest.TestCase):
             mock_server.send_message.assert_called_once()
             mock_server.quit.assert_called_once()
 
+    def test_send_uses_custom_smtp_auth_and_from(self):
+        """SMTP auth username/from can differ from the email platform address."""
+        import asyncio
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "innovacion@lpsgrupo.com",
+            "EMAIL_PASSWORD": "imap-secret",
+            "EMAIL_SMTP_USERNAME": "smtp-user@lpsgrupo.com",
+            "EMAIL_SMTP_PASSWORD": "smtp-secret",
+            "EMAIL_FROM": "innovacion@lpsgrupo.com",
+            "EMAIL_IMAP_HOST": "",
+            "EMAIL_SMTP_HOST": "smtp.office365.com",
+        }):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(adapter.send("user@test.com", "Hello from Hermes!"))
+
+            self.assertTrue(result.success)
+            mock_server.login.assert_called_once_with("smtp-user@lpsgrupo.com", "smtp-secret")
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["From"], "innovacion@lpsgrupo.com")
+
     def test_send_failure_returns_error(self):
         """SMTP failure should return SendResult with error."""
         import asyncio
@@ -1097,6 +1129,36 @@ class TestSendEmailStandalone(unittest.TestCase):
             self.assertEqual(send_call["From"], "hermes@test.com")
 
     @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "innovacion@lpsgrupo.com",
+        "SMTP_USERNAME": "smtp-user@lpsgrupo.com",
+        "SMTP_PASSWORD": "smtp-secret",
+        "MAIL_FROM": "innovacion@lpsgrupo.com",
+        "EMAIL_SMTP_HOST": "smtp.office365.com",
+        "EMAIL_SMTP_PORT": "587",
+    })
+    def test_send_email_tool_accepts_generic_smtp_env_aliases(self):
+        """Standalone sends accept SMTP_USERNAME/SMTP_PASSWORD/MAIL_FROM aliases."""
+        import asyncio
+        from plugins.platforms.email.adapter import _standalone_send as _email_send
+        from types import SimpleNamespace
+
+        async def _send_email(extra, chat_id, message):
+            return await _email_send(SimpleNamespace(token=None, api_key=None, extra=extra or {}), chat_id, message)
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            result = asyncio.run(
+                _send_email({"address": "innovacion@lpsgrupo.com", "smtp_host": "smtp.office365.com"}, "user@test.com", "Hello")
+            )
+
+            self.assertTrue(result["success"])
+            mock_server.login.assert_called_once_with("smtp-user@lpsgrupo.com", "smtp-secret")
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["From"], "innovacion@lpsgrupo.com")
+
+    @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
         "EMAIL_PASSWORD": "secret",
         "EMAIL_SMTP_HOST": "smtp.test.com",
@@ -1360,6 +1422,32 @@ class TestConnectSmtp(unittest.TestCase):
     def test_port_465_uses_smtp_ssl(self):
         """Port 465 should use smtplib.SMTP_SSL (implicit TLS)."""
         adapter = self._make_adapter("465")
+
+        with patch("smtplib.SMTP") as mock_smtp, \
+             patch("smtplib.SMTP_SSL") as mock_smtp_ssl:
+            mock_server = MagicMock()
+            mock_smtp_ssl.return_value = mock_server
+
+            result = adapter._connect_smtp()
+
+            mock_smtp_ssl.assert_called_once()
+            mock_smtp.assert_not_called()
+            self.assertIs(result, mock_server)
+
+    def test_email_smtp_use_ssl_forces_smtp_ssl(self):
+        """EMAIL_SMTP_USE_SSL=true should use implicit TLS regardless of port."""
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+            "EMAIL_SMTP_PORT": "587",
+            "EMAIL_SMTP_USE_SSL": "true",
+        }):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
 
         with patch("smtplib.SMTP") as mock_smtp, \
              patch("smtplib.SMTP_SSL") as mock_smtp_ssl:

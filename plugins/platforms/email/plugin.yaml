@@ -25,6 +25,22 @@ optional_env:
     description: "SMTP port (default 587)"
     prompt: "SMTP port"
     password: false
+  - name: EMAIL_SMTP_USERNAME
+    description: "SMTP login username (defaults to EMAIL_ADDRESS)"
+    prompt: "SMTP username"
+    password: false
+  - name: EMAIL_SMTP_PASSWORD
+    description: "SMTP login password (defaults to EMAIL_PASSWORD)"
+    prompt: "SMTP password"
+    password: true
+  - name: EMAIL_FROM
+    description: "From address for outgoing email (defaults to EMAIL_ADDRESS)"
+    prompt: "From address"
+    password: false
+  - name: EMAIL_SMTP_USE_SSL
+    description: "Use implicit SMTP SSL instead of STARTTLS (default false unless port 465)"
+    prompt: "Use SMTP SSL"
+    password: false
   - name: EMAIL_IMAP_HOST
     description: "IMAP host for inbound polling (e.g. imap.gmail.com)"
     prompt: "IMAP host"

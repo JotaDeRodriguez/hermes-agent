@@ -4673,14 +4673,21 @@ def _platform_status(platform: dict) -> str:
             return "partially configured"
         return "not configured"
     if platform.get("key") == "email":
-        pwd = get_env_value("EMAIL_PASSWORD")
+        pwd = (
+            get_env_value("EMAIL_SMTP_PASSWORD")
+            or get_env_value("SMTP_PASSWORD")
+            or get_env_value("EMAIL_PASSWORD")
+        )
         imap = get_env_value("EMAIL_IMAP_HOST")
         smtp = get_env_value("EMAIL_SMTP_HOST")
+        smtp_user = get_env_value("EMAIL_SMTP_USERNAME") or get_env_value("SMTP_USERNAME")
+        from_addr = get_env_value("EMAIL_FROM") or get_env_value("MAIL_FROM")
+        smtp_ssl = get_env_value("EMAIL_SMTP_USE_SSL") or get_env_value("SMTP_USE_SSL")
         if all([val, pwd, smtp]):
             if imap:
                 return "configured"
             return "configured (SMTP-only)"
-        if any([val, pwd, imap, smtp]):
+        if any([val, pwd, imap, smtp, smtp_user, from_addr, smtp_ssl]):
             return "partially configured"
         return "not configured"
     if platform.get("key") == "matrix":

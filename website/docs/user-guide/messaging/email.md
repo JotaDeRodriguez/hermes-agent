@@ -75,6 +75,10 @@ EMAIL_SMTP_HOST=smtp.gmail.com
 EMAIL_ALLOWED_USERS=your@email.com,colleague@work.com
 
 # Optional
+EMAIL_SMTP_USERNAME=hermes@gmail.com    # SMTP login username, if different
+EMAIL_SMTP_PASSWORD=abcd efgh ijkl mnop # SMTP login password, if different
+EMAIL_FROM=hermes@gmail.com             # From address, if different
+EMAIL_SMTP_USE_SSL=false                # true for implicit SMTP SSL
 EMAIL_IMAP_HOST=imap.gmail.com          # Enables inbound polling when set
 EMAIL_IMAP_PORT=993                    # Default: 993 (IMAP SSL)
 EMAIL_SMTP_PORT=587                    # Default: 587 (SMTP STARTTLS)
@@ -192,6 +196,10 @@ Email access is stricter by default than chat-style platforms:
 | `EMAIL_PASSWORD` | Yes | — | Email password or app password |
 | `EMAIL_IMAP_HOST` | No | — | Optional IMAP server host for inbound polling (e.g., `imap.gmail.com`) |
 | `EMAIL_SMTP_HOST` | Yes | — | SMTP server host (e.g., `smtp.gmail.com`) |
+| `EMAIL_SMTP_USERNAME` | No | — | SMTP login username when different from `EMAIL_ADDRESS` |
+| `EMAIL_SMTP_PASSWORD` | No | — | SMTP login password when different from `EMAIL_PASSWORD` |
+| `EMAIL_FROM` | No | — | From address for outgoing email when different from `EMAIL_ADDRESS` |
+| `EMAIL_SMTP_USE_SSL` | No | `false` | Use implicit SMTP SSL instead of STARTTLS |
 | `EMAIL_IMAP_PORT` | No | `993` | IMAP server port |
 | `EMAIL_SMTP_PORT` | No | `587` | SMTP server port |
 | `EMAIL_POLL_INTERVAL` | No | `15` | Seconds between inbox checks |
@@ -202,3 +210,7 @@ Email access is stricter by default than chat-style platforms:
 `EMAIL_IMAP_HOST` is only required for inbound polling. If you only need SMTP
 delivery, omit `EMAIL_IMAP_HOST`; Hermes starts the Email adapter in SMTP-only
 mode.
+
+Hermes also accepts `SMTP_USERNAME`, `SMTP_PASSWORD`, `MAIL_FROM`, and
+`SMTP_USE_SSL` as aliases for the SMTP-specific settings. The `EMAIL_*` names
+take precedence when both are set.

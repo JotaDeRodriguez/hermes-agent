@@ -12,6 +12,10 @@ Environment variables:
     EMAIL_SMTP_PORT     — SMTP server port (default: 587)
     EMAIL_ADDRESS       — Email address for the agent
     EMAIL_PASSWORD      — Email password or app-specific password
+    EMAIL_SMTP_USERNAME — Optional SMTP auth username (defaults to EMAIL_ADDRESS)
+    EMAIL_SMTP_PASSWORD — Optional SMTP auth password (defaults to EMAIL_PASSWORD)
+    EMAIL_FROM          — Optional From address (defaults to EMAIL_ADDRESS)
+    EMAIL_SMTP_USE_SSL  — Use implicit SMTP SSL even when port is not 465
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 """
@@ -158,6 +162,22 @@ def _is_automated_sender(address: str, headers: dict) -> bool:
         if value and check(value):
             return True
     return False
+
+
+def _env_first(*names: str) -> str:
+    """Return the first non-empty environment value from *names*."""
+    for name in names:
+        value = os.getenv(name, "")
+        if value:
+            return value
+    return ""
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
     
 def check_email_requirements() -> bool:
     """Check if email platform settings are available and non-blank.
@@ -168,7 +188,7 @@ def check_email_requirements() -> bool:
     for cron notifications and explicit outbound sends.
     """
     addr = os.getenv("EMAIL_ADDRESS", "").strip()
-    pwd = os.getenv("EMAIL_PASSWORD", "").strip()
+    pwd = _env_first("EMAIL_SMTP_PASSWORD", "SMTP_PASSWORD", "EMAIL_PASSWORD").strip()
     smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
     return all([addr, pwd, smtp])
 
@@ -327,10 +347,27 @@ class EmailAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self._address = (os.getenv("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
         self._password = os.getenv("EMAIL_PASSWORD", "")
+        self._smtp_username = (
+            os.getenv("EMAIL_SMTP_USERNAME", "")
+            or os.getenv("SMTP_USERNAME", "")
+            or extra.get("smtp_username", "")
+            or self._address
+        ).strip()
+        self._smtp_password = _env_first("EMAIL_SMTP_PASSWORD", "SMTP_PASSWORD", "EMAIL_PASSWORD")
+        self._from_address = (
+            os.getenv("EMAIL_FROM", "")
+            or os.getenv("MAIL_FROM", "")
+            or extra.get("from_address", "")
+            or self._address
+        ).strip()
         self._imap_host = (os.getenv("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
         self._imap_port = env_int("EMAIL_IMAP_PORT", 993)
         self._smtp_host = (os.getenv("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
         self._smtp_port = env_int("EMAIL_SMTP_PORT", 587)
+        self._smtp_use_ssl = _env_bool(
+            "EMAIL_SMTP_USE_SSL",
+            _env_bool("SMTP_USE_SSL", self._smtp_port == 465),
+        )
         self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
 
         # Skip attachments — configured via config.yaml:
@@ -372,8 +409,8 @@ class EmailAdapter(BasePlatformAdapter):
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
 
-        Port 465 uses implicit TLS (``SMTP_SSL``).  All other ports use
-        ``SMTP`` + ``STARTTLS``.
+        Port 465 or ``EMAIL_SMTP_USE_SSL=true`` uses implicit TLS
+        (``SMTP_SSL``). All other connections use ``SMTP`` + ``STARTTLS``.
 
         When the host resolves to an IPv6 address that is unreachable
         (common on networks without IPv6 routing), the default connection can
@@ -392,7 +429,7 @@ class EmailAdapter(BasePlatformAdapter):
             """Attempt one SMTP connection."""
             smtp_cls = _IPv4SMTP if ipv4_only else smtplib.SMTP
             smtp_ssl_cls = _IPv4SMTP_SSL if ipv4_only else smtplib.SMTP_SSL
-            if port == 465:
+            if self._smtp_use_ssl:
                 return smtp_ssl_cls(host, port, timeout=SMTP_CONNECT_TIMEOUT, context=ctx)
             smtp = smtp_cls(host, port, timeout=SMTP_CONNECT_TIMEOUT)
             try:
@@ -417,7 +454,8 @@ class EmailAdapter(BasePlatformAdapter):
             name
             for name, value in (
                 ("EMAIL_ADDRESS", self._address),
-                ("EMAIL_PASSWORD", self._password),
+                ("EMAIL_SMTP_USERNAME", self._smtp_username),
+                ("EMAIL_SMTP_PASSWORD or EMAIL_PASSWORD", self._smtp_password),
                 ("EMAIL_SMTP_HOST", self._smtp_host),
             )
             if not value
@@ -465,7 +503,7 @@ class EmailAdapter(BasePlatformAdapter):
             # Test SMTP connection
             smtp = self._connect_smtp()
             try:
-                smtp.login(self._address, self._password)
+                smtp.login(self._smtp_username, self._smtp_password)
             finally:
                 smtp.quit()
             logger.info("[Email] SMTP connection test passed.")
@@ -685,7 +723,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
 
         # Thread context for reply
@@ -709,7 +747,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.login(self._smtp_username, self._smtp_password)
             smtp.send_message(msg)
         finally:
             try:
@@ -800,7 +838,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
@@ -835,7 +873,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.login(self._smtp_username, self._smtp_password)
             smtp.send_message(msg)
         finally:
             try:
@@ -880,7 +918,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
@@ -913,7 +951,7 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            smtp.login(self._smtp_username, self._smtp_password)
             smtp.send_message(msg)
         finally:
             try:
@@ -964,26 +1002,48 @@ async def _standalone_send(
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
-    password = os.getenv("EMAIL_PASSWORD", "")
+    smtp_username = (
+        os.getenv("EMAIL_SMTP_USERNAME", "")
+        or os.getenv("SMTP_USERNAME", "")
+        or extra.get("smtp_username", "")
+        or address
+    )
+    password = _env_first("EMAIL_SMTP_PASSWORD", "SMTP_PASSWORD", "EMAIL_PASSWORD")
+    from_address = (
+        os.getenv("EMAIL_FROM", "")
+        or os.getenv("MAIL_FROM", "")
+        or extra.get("from_address", "")
+        or address
+    )
     smtp_host = extra.get("smtp_host") or os.getenv("EMAIL_SMTP_HOST", "")
     try:
         smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
     except (ValueError, TypeError):
         smtp_port = 587
+    smtp_use_ssl = _env_bool("EMAIL_SMTP_USE_SSL", _env_bool("SMTP_USE_SSL", smtp_port == 465))
 
-    if not all([address, password, smtp_host]):
-        return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
+    if not all([address, smtp_username, password, smtp_host]):
+        return {
+            "error": (
+                "Email not configured (EMAIL_ADDRESS, EMAIL_SMTP_HOST, and "
+                "EMAIL_SMTP_PASSWORD or EMAIL_PASSWORD required)"
+            )
+        }
 
     try:
         msg = MIMEText(message, "plain", "utf-8")
-        msg["From"] = address
+        msg["From"] = from_address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
         msg["Date"] = formatdate(localtime=True)
 
-        server = smtplib.SMTP(smtp_host, smtp_port)
-        server.starttls(context=_ssl.create_default_context())
-        server.login(address, password)
+        ctx = _ssl.create_default_context()
+        if smtp_use_ssl:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, context=ctx)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port)
+            server.starttls(context=ctx)
+        server.login(smtp_username, password)
         server.send_message(msg)
         server.quit()
         return {"success": True, "platform": "email", "chat_id": chat_id}

@@ -18,9 +18,22 @@ Environment variables:
     EMAIL_SMTP_USE_SSL  — Use implicit SMTP SSL even when port is not 465
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
+
+    OAuth2 / Microsoft Graph (outbound only):
+    EMAIL_OAUTH_TENANT_ID     — Azure AD tenant id (client-credentials flow)
+    EMAIL_OAUTH_CLIENT_ID     — Azure app registration client id
+    EMAIL_OAUTH_CLIENT_SECRET — Azure app client secret
+
+    When all three EMAIL_OAUTH_* vars are set, every outbound message is sent
+    via the Microsoft Graph ``sendMail`` API (app-only client-credentials flow)
+    instead of SMTP basic auth. This is required where the mailbox provider
+    (M365 Conditional Access) blocks legacy/basic SMTP auth from the deployment
+    location but permits OAuth2. SMTP basic auth remains the fallback when the
+    OAuth vars are absent. IMAP receiving still uses basic auth.
 """
 
 import asyncio
+import base64
 import email as email_lib
 import imaplib
 import logging
@@ -29,7 +42,10 @@ import re
 import smtplib
 import socket
 import ssl
+import threading
+import time
 import uuid
+from urllib.parse import quote
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -178,7 +194,132 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
-    
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# OAuth2 / Microsoft Graph outbound (app-only client-credentials flow).
+#
+# Why this exists: M365 Conditional Access blocks SMTP *basic auth* from some
+# deployment locations (e.g. cloud datacenters) with "535 5.7.139 ...basic
+# authentication is disabled", even when the password is correct. OAuth2 is not
+# blocked. When EMAIL_OAUTH_* are configured we send via Graph instead of SMTP.
+# ──────────────────────────────────────────────────────────────────────────
+
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+GRAPH_HTTP_TIMEOUT = 30
+
+# access_token cache keyed by "tenant:client_id" -> (token, expiry_epoch).
+# Tokens last ~1h; caching avoids a token round-trip on every send. Guarded by
+# a lock because sends run in executor threads.
+_GRAPH_TOKEN_CACHE: Dict[str, Tuple[str, float]] = {}
+_GRAPH_TOKEN_LOCK = threading.Lock()
+
+
+def _oauth_credentials() -> Optional[Tuple[str, str, str]]:
+    """Return (tenant_id, client_id, client_secret) when all three OAuth env
+    vars are set and non-blank, else None (signals SMTP basic-auth fallback)."""
+    tenant = os.getenv("EMAIL_OAUTH_TENANT_ID", "").strip()
+    client_id = os.getenv("EMAIL_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.getenv("EMAIL_OAUTH_CLIENT_SECRET", "").strip()
+    if tenant and client_id and client_secret:
+        return tenant, client_id, client_secret
+    return None
+
+
+def _graph_access_token(tenant: str, client_id: str, client_secret: str) -> str:
+    """Fetch (and cache) an app-only Graph access token via client-credentials."""
+    import requests  # core dep; imported lazily so module import never hard-fails
+
+    cache_key = f"{tenant}:{client_id}"
+    now = time.time()
+    with _GRAPH_TOKEN_LOCK:
+        cached = _GRAPH_TOKEN_CACHE.get(cache_key)
+        if cached and cached[1] - 60 > now:
+            return cached[0]
+
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": GRAPH_SCOPE,
+        },
+        timeout=GRAPH_HTTP_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"OAuth token request failed ({resp.status_code}): {resp.text[:300]}"
+        )
+    payload = resp.json()
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError(f"OAuth token response missing access_token: {payload}")
+    expires_in = int(payload.get("expires_in", 3600))
+    with _GRAPH_TOKEN_LOCK:
+        _GRAPH_TOKEN_CACHE[cache_key] = (token, now + expires_in)
+    return token
+
+
+def _graph_file_attachment(
+    filename: str, content: bytes, content_type: str = "application/octet-stream"
+) -> Dict[str, Any]:
+    """Build a Graph fileAttachment object (base64-encoded content)."""
+    return {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": filename,
+        "contentType": content_type,
+        "contentBytes": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def _graph_send_mail(
+    oauth: Tuple[str, str, str],
+    *,
+    sender: str,
+    to_addr: str,
+    subject: str,
+    body: str,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Send a message via Graph ``POST /users/{sender}/sendMail``.
+
+    ``sender`` is the mailbox the app sends as (app-only requires the Mail.Send
+    application permission on that mailbox). Threading: app-only sendMail only
+    permits custom ``x-*`` internetMessageHeaders, so standard
+    In-Reply-To/References can't be set here — replies thread by the ``Re:``
+    subject instead. Raises RuntimeError on a non-2xx response.
+    """
+    import requests  # core dep; lazy import keeps module import resilient
+
+    tenant, client_id, client_secret = oauth
+    token = _graph_access_token(tenant, client_id, client_secret)
+
+    message: Dict[str, Any] = {
+        "subject": subject,
+        "body": {"contentType": "Text", "content": body},
+        "toRecipients": [{"emailAddress": {"address": to_addr}}],
+    }
+    if attachments:
+        message["attachments"] = attachments
+
+    resp = requests.post(
+        f"{GRAPH_BASE_URL}/users/{quote(sender)}/sendMail",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"message": message, "saveToSentItems": True},
+        timeout=GRAPH_HTTP_TIMEOUT,
+    )
+    # Graph returns 202 Accepted on success.
+    if resp.status_code not in (200, 202):
+        raise RuntimeError(
+            f"Graph sendMail failed ({resp.status_code}): {resp.text[:300]}"
+        )
+
+
 def check_email_requirements() -> bool:
     """Check if email platform settings are available and non-blank.
 
@@ -186,8 +327,13 @@ def check_email_requirements() -> bool:
     left empty ``EMAIL_*`` keys in ``.env`` does not enable the platform (#40715).
     IMAP is optional: when omitted, the adapter can still run in SMTP-only mode
     for cron notifications and explicit outbound sends.
+
+    OAuth2/Graph mode only needs EMAIL_ADDRESS plus the three EMAIL_OAUTH_* vars
+    (no SMTP host/password), since outbound goes over Graph rather than SMTP.
     """
     addr = os.getenv("EMAIL_ADDRESS", "").strip()
+    if addr and _oauth_credentials():
+        return True
     pwd = _env_first("EMAIL_SMTP_PASSWORD", "SMTP_PASSWORD", "EMAIL_PASSWORD").strip()
     smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
     return all([addr, pwd, smtp])
@@ -370,6 +516,10 @@ class EmailAdapter(BasePlatformAdapter):
         )
         self._poll_interval = env_int("EMAIL_POLL_INTERVAL", 15)
 
+        # OAuth2/Graph outbound: when configured, all sends go via Microsoft
+        # Graph (app-only) instead of SMTP basic auth. None => SMTP fallback.
+        self._oauth = _oauth_credentials()
+
         # Skip attachments — configured via config.yaml:
         #   platforms:
         #     email:
@@ -450,16 +600,19 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def connect(self) -> bool:
         """Connect to email services and start polling when IMAP is configured."""
-        missing = [
-            name
-            for name, value in (
+        # In OAuth/Graph mode, outbound goes over Graph — SMTP host/username/
+        # password are not required, only EMAIL_ADDRESS (the mailbox to send as)
+        # plus the three EMAIL_OAUTH_* vars (validated when building self._oauth).
+        if self._oauth:
+            required = (("EMAIL_ADDRESS", self._address),)
+        else:
+            required = (
                 ("EMAIL_ADDRESS", self._address),
                 ("EMAIL_SMTP_USERNAME", self._smtp_username),
                 ("EMAIL_SMTP_PASSWORD or EMAIL_PASSWORD", self._smtp_password),
                 ("EMAIL_SMTP_HOST", self._smtp_host),
             )
-            if not value
-        ]
+        missing = [name for name, value in required if not value]
         if missing:
             message = (
                 "Not configured — missing "
@@ -499,17 +652,28 @@ class EmailAdapter(BasePlatformAdapter):
         else:
             logger.info("[Email] IMAP host not configured; starting in SMTP-only mode.")
 
-        try:
-            # Test SMTP connection
-            smtp = self._connect_smtp()
+        if self._oauth:
+            # Validate the OAuth path by acquiring a Graph token (basic-auth SMTP
+            # would fail here on locations where it's blocked — the very reason
+            # OAuth mode exists).
             try:
-                smtp.login(self._smtp_username, self._smtp_password)
-            finally:
-                smtp.quit()
-            logger.info("[Email] SMTP connection test passed.")
-        except Exception as e:
-            logger.error("[Email] SMTP connection failed: %s", e)
-            return False
+                _graph_access_token(*self._oauth)
+                logger.info("[Email] OAuth2/Graph token acquired — outbound via Graph.")
+            except Exception as e:
+                logger.error("[Email] OAuth2/Graph token request failed: %s", e)
+                return False
+        else:
+            try:
+                # Test SMTP connection
+                smtp = self._connect_smtp()
+                try:
+                    smtp.login(self._smtp_username, self._smtp_password)
+                finally:
+                    smtp.quit()
+                logger.info("[Email] SMTP connection test passed.")
+            except Exception as e:
+                logger.error("[Email] SMTP connection failed: %s", e)
+                return False
 
         self._running = True
         if self._imap_host:
@@ -715,25 +879,59 @@ class EmailAdapter(BasePlatformAdapter):
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
 
+    def _reply_subject(self, to_addr: str) -> str:
+        """Compute the (Re:-prefixed) reply subject from stored thread context."""
+        subject = self._thread_context.get(to_addr, {}).get("subject", "Hermes Agent")
+        if not subject.startswith("Re:"):
+            subject = f"Re: {subject}"
+        return subject
+
+    def _graph_send(
+        self,
+        to_addr: str,
+        subject: str,
+        body: str,
+        attachments: Optional[List[Tuple[str, bytes, str]]] = None,
+    ) -> str:
+        """Send via Microsoft Graph. ``attachments`` is a list of
+        (filename, content_bytes, content_type). Returns a synthetic Message-ID
+        (Graph assigns the real one server-side). Runs in executor thread."""
+        graph_attachments = [
+            _graph_file_attachment(name, content, ctype)
+            for (name, content, ctype) in (attachments or [])
+        ]
+        _graph_send_mail(
+            self._oauth,
+            sender=self._address,
+            to_addr=to_addr,
+            subject=subject,
+            body=body,
+            attachments=graph_attachments,
+        )
+        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._address.split('@')[1]}>"
+        logger.info("[Email] Sent via Graph to %s (subject: %s)", to_addr, subject)
+        return msg_id
+
     def _send_email(
         self,
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
     ) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
+        """Send an email. Uses Graph when OAuth is configured, else SMTP.
+        Runs in executor thread."""
+        subject = self._reply_subject(to_addr)
+
+        if self._oauth:
+            return self._graph_send(to_addr, subject, body)
+
         msg = MIMEMultipart()
         msg["From"] = self._from_address
         msg["To"] = to_addr
-
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
         msg["Subject"] = subject
 
         # Threading headers
+        ctx = self._thread_context.get(to_addr, {})
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
@@ -836,17 +1034,26 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_paths: List[str],
     ) -> str:
-        """Send an email with multiple file attachments via SMTP."""
+        """Send an email with multiple file attachments. Graph when OAuth is
+        configured, else SMTP."""
+        subject = self._reply_subject(to_addr)
+
+        if self._oauth:
+            attachments: List[Tuple[str, bytes, str]] = []
+            for file_path in file_paths:
+                p = Path(file_path)
+                try:
+                    attachments.append((p.name, p.read_bytes(), "application/octet-stream"))
+                except Exception as e:
+                    logger.warning("[Email] Failed to attach %s: %s", file_path, e)
+            return self._graph_send(to_addr, subject, body, attachments)
+
         msg = MIMEMultipart()
         msg["From"] = self._from_address
         msg["To"] = to_addr
-
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
         msg["Subject"] = subject
 
+        ctx = self._thread_context.get(to_addr, {})
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
@@ -916,17 +1123,22 @@ class EmailAdapter(BasePlatformAdapter):
         file_path: str,
         file_name: Optional[str] = None,
     ) -> str:
-        """Send an email with a file attachment via SMTP."""
+        """Send an email with a file attachment. Graph when OAuth is
+        configured, else SMTP."""
+        subject = self._reply_subject(to_addr)
+        p = Path(file_path)
+        fname = file_name or p.name
+
+        if self._oauth:
+            attachments = [(fname, p.read_bytes(), "application/octet-stream")]
+            return self._graph_send(to_addr, subject, body, attachments)
+
         msg = MIMEMultipart()
         msg["From"] = self._from_address
         msg["To"] = to_addr
-
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
         msg["Subject"] = subject
 
+        ctx = self._thread_context.get(to_addr, {})
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
@@ -940,8 +1152,6 @@ class EmailAdapter(BasePlatformAdapter):
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
         # Attach file
-        p = Path(file_path)
-        fname = file_name or p.name
         with open(p, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -993,8 +1203,11 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
 ):
-    """Out-of-process Email delivery via SMTP (one-shot). Implements the
-    standalone_sender_fn contract; replaces the legacy _send_email helper."""
+    """Out-of-process Email delivery (one-shot). Implements the
+    standalone_sender_fn contract; replaces the legacy _send_email helper.
+
+    Uses Microsoft Graph (OAuth2) when EMAIL_OAUTH_* are configured, else SMTP
+    basic auth."""
     import smtplib
     import ssl as _ssl
     from email.mime.text import MIMEText
@@ -1002,6 +1215,39 @@ async def _standalone_send(
 
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
+
+    # OAuth2/Graph path — preferred when configured (mirrors the adapter).
+    oauth = _oauth_credentials()
+    if oauth and address:
+        try:
+            attachments = []
+            for fpath in (media_files or []):
+                try:
+                    p = Path(fpath)
+                    attachments.append((p.name, p.read_bytes(), "application/octet-stream"))
+                except Exception as e:
+                    logger.warning("[Email] Failed to attach %s: %s", fpath, e)
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _graph_send_mail(
+                    oauth,
+                    sender=address,
+                    to_addr=chat_id,
+                    subject="Hermes Agent",
+                    body=message,
+                    attachments=[
+                        _graph_file_attachment(n, c, t) for (n, c, t) in attachments
+                    ],
+                ),
+            )
+            return {"success": True, "platform": "email", "chat_id": chat_id}
+        except Exception as e:
+            try:
+                from tools.send_message_tool import _error as _e
+                return _e(f"Email send failed: {e}")
+            except Exception:
+                return {"error": f"Email send failed: {e}"}
+
     smtp_username = (
         os.getenv("EMAIL_SMTP_USERNAME", "")
         or os.getenv("SMTP_USERNAME", "")

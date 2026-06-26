@@ -1632,5 +1632,234 @@ class TestConnectionConfigResolution(unittest.TestCase):
             self.assertTrue(check_email_requirements())
 
 
+class TestOAuthGraphSend(unittest.TestCase):
+    """OAuth2 / Microsoft Graph outbound path (used when EMAIL_OAUTH_* set).
+
+    Mirrors the diagnosis that M365 blocks SMTP basic auth from some locations
+    while permitting OAuth2: when the three EMAIL_OAUTH_* vars are present, every
+    outbound message must go via Graph sendMail instead of smtplib.
+    """
+
+    OAUTH_ENV = {
+        "EMAIL_ADDRESS": "innovacion@lpsgrupo.com",
+        "EMAIL_IMAP_HOST": "",
+        "EMAIL_OAUTH_TENANT_ID": "tenant-123",
+        "EMAIL_OAUTH_CLIENT_ID": "client-abc",
+        "EMAIL_OAUTH_CLIENT_SECRET": "shh-secret",
+    }
+
+    def setUp(self):
+        # Token cache is module-global and keyed by tenant:client_id; clear it so
+        # each test exercises the real token round-trip rather than a cache hit.
+        import plugins.platforms.email.adapter as email_mod
+        email_mod._GRAPH_TOKEN_CACHE.clear()
+
+    def _mock_post(self, send_status=202):
+        """requests.post stub: token endpoint -> 200+token, sendMail -> 202."""
+        calls = []
+
+        def _post(url, **kwargs):
+            calls.append((url, kwargs))
+            resp = MagicMock()
+            if url.endswith("/token"):
+                resp.status_code = 200
+                resp.json.return_value = {"access_token": "fake-token", "expires_in": 3600}
+            else:
+                resp.status_code = send_status
+                resp.text = "error-detail" if send_status >= 400 else ""
+            return resp
+
+        return _post, calls
+
+    def _make_adapter(self, extra_env=None):
+        from gateway.config import PlatformConfig
+        env = dict(self.OAUTH_ENV)
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env, clear=False):
+            from plugins.platforms.email.adapter import EmailAdapter
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_oauth_detected_in_init(self):
+        adapter = self._make_adapter()
+        self.assertEqual(
+            adapter._oauth, ("tenant-123", "client-abc", "shh-secret")
+        )
+
+    def test_send_uses_graph_not_smtp(self):
+        import asyncio
+        adapter = self._make_adapter()
+        post, calls = self._mock_post()
+
+        with patch("requests.post", side_effect=post), \
+             patch("smtplib.SMTP") as mock_smtp, \
+             patch("smtplib.SMTP_SSL") as mock_smtp_ssl:
+            result = asyncio.run(adapter.send("user@test.com", "Hello via Graph"))
+
+        self.assertTrue(result.success)
+        # SMTP must never be touched when OAuth is configured.
+        mock_smtp.assert_not_called()
+        mock_smtp_ssl.assert_not_called()
+        # One token request + one sendMail request.
+        token_calls = [c for c in calls if c[0].endswith("/token")]
+        send_calls = [c for c in calls if "sendMail" in c[0]]
+        self.assertEqual(len(token_calls), 1)
+        self.assertEqual(len(send_calls), 1)
+        # Token request uses client-credentials with the .default scope.
+        self.assertIn("tenant-123", token_calls[0][0])
+        self.assertEqual(token_calls[0][1]["data"]["grant_type"], "client_credentials")
+        self.assertEqual(
+            token_calls[0][1]["data"]["scope"], "https://graph.microsoft.com/.default"
+        )
+        # sendMail targets the mailbox and carries the message + recipient.
+        send_url, send_kwargs = send_calls[0]
+        self.assertIn("innovacion%40lpsgrupo.com", send_url)
+        message = send_kwargs["json"]["message"]
+        self.assertEqual(message["subject"], "Re: Hermes Agent")
+        self.assertEqual(message["body"]["content"], "Hello via Graph")
+        self.assertEqual(
+            message["toRecipients"][0]["emailAddress"]["address"], "user@test.com"
+        )
+        self.assertEqual(
+            send_kwargs["headers"]["Authorization"], "Bearer fake-token"
+        )
+
+    def test_send_threads_with_re_subject(self):
+        import asyncio
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Project question", "message_id": "<orig@test.com>",
+        }
+        post, calls = self._mock_post()
+
+        with patch("requests.post", side_effect=post):
+            asyncio.run(adapter.send("user@test.com", "Answer"))
+
+        send_kwargs = [c for c in calls if "sendMail" in c[0]][0][1]
+        self.assertEqual(send_kwargs["json"]["message"]["subject"], "Re: Project question")
+
+    def test_graph_send_error_returns_failure(self):
+        import asyncio
+        adapter = self._make_adapter()
+        post, _ = self._mock_post(send_status=403)
+
+        with patch("requests.post", side_effect=post):
+            result = asyncio.run(adapter.send("user@test.com", "Hello"))
+
+        self.assertFalse(result.success)
+        self.assertIn("Graph sendMail failed", result.error)
+
+    def test_send_document_attaches_via_graph(self):
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter()
+        post, calls = self._mock_post()
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"attachment bytes")
+            tmp_path = f.name
+        try:
+            with patch("requests.post", side_effect=post), \
+                 patch("smtplib.SMTP") as mock_smtp:
+                result = asyncio.run(
+                    adapter.send_document("user@test.com", tmp_path, "Here")
+                )
+        finally:
+            os.unlink(tmp_path)
+
+        self.assertTrue(result.success)
+        mock_smtp.assert_not_called()
+        message = [c for c in calls if "sendMail" in c[0]][0][1]["json"]["message"]
+        self.assertEqual(len(message["attachments"]), 1)
+        att = message["attachments"][0]
+        self.assertEqual(att["@odata.type"], "#microsoft.graph.fileAttachment")
+        import base64
+        self.assertEqual(base64.b64decode(att["contentBytes"]), b"attachment bytes")
+
+    def test_connect_validates_graph_token_not_smtp(self):
+        import asyncio
+        adapter = self._make_adapter()
+        post, calls = self._mock_post()
+
+        with patch("requests.post", side_effect=post), \
+             patch("imaplib.IMAP4_SSL") as mock_imap, \
+             patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(adapter.connect())
+
+        self.assertTrue(result)
+        self.assertTrue(adapter._running)
+        self.assertIsNone(adapter._poll_task)  # SMTP-only (no IMAP host)
+        mock_imap.assert_not_called()
+        mock_smtp.assert_not_called()
+        self.assertTrue(any(c[0].endswith("/token") for c in calls))
+        adapter._running = False
+
+    def test_connect_fails_when_token_request_fails(self):
+        import asyncio
+        adapter = self._make_adapter()
+
+        with patch("requests.post", side_effect=Exception("network down")), \
+             patch("smtplib.SMTP") as mock_smtp:
+            result = asyncio.run(adapter.connect())
+
+        self.assertFalse(result)
+        mock_smtp.assert_not_called()
+
+    def test_check_requirements_oauth_only(self):
+        """EMAIL_ADDRESS + EMAIL_OAUTH_* alone satisfies the startup gate (no SMTP)."""
+        from plugins.platforms.email.adapter import check_email_requirements
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "innovacion@lpsgrupo.com",
+            "EMAIL_SMTP_HOST": "",
+            "EMAIL_PASSWORD": "",
+            "EMAIL_SMTP_PASSWORD": "",
+            "EMAIL_OAUTH_TENANT_ID": "tenant-123",
+            "EMAIL_OAUTH_CLIENT_ID": "client-abc",
+            "EMAIL_OAUTH_CLIENT_SECRET": "shh-secret",
+        }, clear=True):
+            self.assertTrue(check_email_requirements())
+
+    def test_token_is_cached_across_sends(self):
+        import asyncio
+        adapter = self._make_adapter()
+        post, calls = self._mock_post()
+
+        with patch("requests.post", side_effect=post):
+            asyncio.run(adapter.send("user@test.com", "first"))
+            asyncio.run(adapter.send("user@test.com", "second"))
+
+        token_calls = [c for c in calls if c[0].endswith("/token")]
+        send_calls = [c for c in calls if "sendMail" in c[0]]
+        # Token fetched once and reused; two messages sent.
+        self.assertEqual(len(token_calls), 1)
+        self.assertEqual(len(send_calls), 2)
+
+    def test_standalone_send_uses_graph(self):
+        import asyncio
+        from plugins.platforms.email.adapter import _standalone_send
+        from types import SimpleNamespace
+        post, calls = self._mock_post()
+
+        with patch.dict(os.environ, self.OAUTH_ENV, clear=False):
+            with patch("requests.post", side_effect=post), \
+                 patch("smtplib.SMTP") as mock_smtp:
+                result = asyncio.run(
+                    _standalone_send(
+                        SimpleNamespace(token=None, api_key=None, extra={}),
+                        "user@test.com",
+                        "Hello standalone",
+                    )
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["platform"], "email")
+        mock_smtp.assert_not_called()
+        message = [c for c in calls if "sendMail" in c[0]][0][1]["json"]["message"]
+        self.assertEqual(message["body"]["content"], "Hello standalone")
+        self.assertEqual(
+            message["toRecipients"][0]["emailAddress"]["address"], "user@test.com"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

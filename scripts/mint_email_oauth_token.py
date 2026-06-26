@@ -9,11 +9,9 @@ approve. The script then prints the value to put in EMAIL_OAUTH_REFRESH_TOKEN.
 
 Prerequisites:
   * The three app vars in your environment (or a local .env you load first):
-      EMAIL_OAUTH_TENANT_ID, EMAIL_OAUTH_CLIENT_ID
-    (EMAIL_OAUTH_CLIENT_SECRET is NOT needed for device-code minting.)
-  * The Azure app must allow public client flows:
-      App registration -> Authentication -> "Allow public client flows" = Yes
-    (an app *owner* can toggle this — it does not need a tenant admin).
+      EMAIL_OAUTH_TENANT_ID, EMAIL_OAUTH_CLIENT_ID, EMAIL_OAUTH_CLIENT_SECRET
+    (the secret is included in the token exchange because the app is registered
+    as a confidential client — no "Allow public client flows" toggle needed).
   * The app must already have the delegated `Mail.Send` + `offline_access`
     permissions consented (your screenshot showed both are already granted).
 
@@ -50,6 +48,7 @@ def _require(name: str) -> str:
 def main() -> None:
     tenant = _require("EMAIL_OAUTH_TENANT_ID")
     client_id = _require("EMAIL_OAUTH_CLIENT_ID")
+    client_secret = _require("EMAIL_OAUTH_CLIENT_SECRET")
 
     base = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0"
 
@@ -81,6 +80,7 @@ def main() -> None:
             data={
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 "client_id": client_id,
+                "client_secret": client_secret,
                 "device_code": device_code,
             },
             timeout=30,

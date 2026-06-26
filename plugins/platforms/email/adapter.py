@@ -2,10 +2,11 @@
 Email platform adapter for the Hermes gateway.
 
 Allows users to interact with Hermes by sending emails.
-Uses IMAP to receive and SMTP to send messages.
+Uses IMAP to receive and SMTP to send messages. If IMAP is not configured,
+the adapter runs in SMTP-only mode for outbound delivery.
 
 Environment variables:
-    EMAIL_IMAP_HOST     — IMAP server host (e.g., imap.gmail.com)
+    EMAIL_IMAP_HOST     — Optional IMAP server host (e.g., imap.gmail.com)
     EMAIL_IMAP_PORT     — IMAP server port (default: 993)
     EMAIL_SMTP_HOST     — SMTP server host (e.g., smtp.gmail.com)
     EMAIL_SMTP_PORT     — SMTP server port (default: 587)
@@ -163,12 +164,13 @@ def check_email_requirements() -> bool:
 
     Treats blank/whitespace-only values as missing so an abandoned setup that
     left empty ``EMAIL_*`` keys in ``.env`` does not enable the platform (#40715).
+    IMAP is optional: when omitted, the adapter can still run in SMTP-only mode
+    for cron notifications and explicit outbound sends.
     """
     addr = os.getenv("EMAIL_ADDRESS", "").strip()
     pwd = os.getenv("EMAIL_PASSWORD", "").strip()
-    imap = os.getenv("EMAIL_IMAP_HOST", "").strip()
     smtp = os.getenv("EMAIL_SMTP_HOST", "").strip()
-    return all([addr, pwd, imap, smtp])
+    return all([addr, pwd, smtp])
 
 
 def _decode_header_value(raw: str) -> str:
@@ -304,7 +306,12 @@ def _extract_attachments(
 
 
 class EmailAdapter(BasePlatformAdapter):
-    """Email gateway adapter using IMAP (receive) and SMTP (send)."""
+    """Email gateway adapter using IMAP (receive) and SMTP (send).
+
+    When no IMAP host is configured, the adapter starts in SMTP-only mode. That
+    supports deployments where a provider allows SMTP basic auth for outbound
+    delivery but requires OAuth2 for IMAP.
+    """
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
@@ -405,16 +412,12 @@ class EmailAdapter(BasePlatformAdapter):
             return _connect(ipv4_only=True)
 
     async def connect(self) -> bool:
-        """Connect to the IMAP server and start polling for new messages."""
-        # Validate up front so a missing host surfaces as an actionable config
-        # error instead of IMAP4_SSL("") raising the cryptic
-        # ``[Errno 8] nodename nor servname provided, or not known``.
+        """Connect to email services and start polling when IMAP is configured."""
         missing = [
             name
             for name, value in (
                 ("EMAIL_ADDRESS", self._address),
                 ("EMAIL_PASSWORD", self._password),
-                ("EMAIL_IMAP_HOST", self._imap_host),
                 ("EMAIL_SMTP_HOST", self._smtp_host),
             )
             if not value
@@ -427,33 +430,36 @@ class EmailAdapter(BasePlatformAdapter):
                 "in config.yaml."
             )
             logger.error("[Email] %s", message)
-            # Mark non-retryable so the gateway does NOT keep reconnecting against
-            # an empty host. A blank-but-present env var (e.g. ``EMAIL_IMAP_HOST=``)
-            # used to slip past the startup gate and drive an indefinite retry
-            # loop that leaked memory until the host OOM-killed (#40715).
+            # Mark non-retryable so the gateway does NOT keep reconnecting
+            # against empty required settings. Blank-but-present env vars used
+            # to slip past the startup gate and drive an indefinite retry loop
+            # that leaked memory until the host OOM-killed (#40715).
             self._set_fatal_error(
                 "email_missing_configuration", message, retryable=False
             )
             return False
 
-        try:
-            # Test IMAP connection
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
-            imap.login(self._address, self._password)
-            _send_imap_id(imap)
-            # Mark all existing messages as seen so we only process new ones
-            imap.select("INBOX")
-            status, data = imap.uid("search", None, "ALL")
-            if status == "OK" and data and data[0]:
-                for uid in data[0].split():
-                    self._seen_uids.add(uid)
-            # Keep only the most recent UIDs to prevent unbounded growth
-            self._trim_seen_uids()
-            imap.logout()
-            logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
-        except Exception as e:
-            logger.error("[Email] IMAP connection failed: %s", e)
-            return False
+        if self._imap_host:
+            try:
+                # Test IMAP connection
+                imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+                imap.login(self._address, self._password)
+                _send_imap_id(imap)
+                # Mark all existing messages as seen so we only process new ones
+                imap.select("INBOX")
+                status, data = imap.uid("search", None, "ALL")
+                if status == "OK" and data and data[0]:
+                    for uid in data[0].split():
+                        self._seen_uids.add(uid)
+                # Keep only the most recent UIDs to prevent unbounded growth
+                self._trim_seen_uids()
+                imap.logout()
+                logger.info("[Email] IMAP connection test passed. %d existing messages skipped.", len(self._seen_uids))
+            except Exception as e:
+                logger.error("[Email] IMAP connection failed: %s", e)
+                return False
+        else:
+            logger.info("[Email] IMAP host not configured; starting in SMTP-only mode.")
 
         try:
             # Test SMTP connection
@@ -468,8 +474,12 @@ class EmailAdapter(BasePlatformAdapter):
             return False
 
         self._running = True
-        self._poll_task = asyncio.create_task(self._poll_loop())
-        print(f"[Email] Connected as {self._address}")
+        if self._imap_host:
+            self._poll_task = asyncio.create_task(self._poll_loop())
+            print(f"[Email] Connected as {self._address}")
+        else:
+            self._poll_task = None
+            print(f"[Email] Connected as {self._address} (SMTP-only)")
         return True
 
     async def disconnect(self) -> None:

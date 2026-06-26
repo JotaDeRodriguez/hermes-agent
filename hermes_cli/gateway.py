@@ -4676,8 +4676,10 @@ def _platform_status(platform: dict) -> str:
         pwd = get_env_value("EMAIL_PASSWORD")
         imap = get_env_value("EMAIL_IMAP_HOST")
         smtp = get_env_value("EMAIL_SMTP_HOST")
-        if all([val, pwd, imap, smtp]):
-            return "configured"
+        if all([val, pwd, smtp]):
+            if imap:
+                return "configured"
+            return "configured (SMTP-only)"
         if any([val, pwd, imap, smtp]):
             return "partially configured"
         return "not configured"

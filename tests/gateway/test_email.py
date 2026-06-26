@@ -39,6 +39,23 @@ class TestConfigEnvOverrides(unittest.TestCase):
         self.assertIn(Platform.EMAIL, config.platforms)
         self.assertTrue(config.platforms[Platform.EMAIL].enabled)
         self.assertEqual(config.platforms[Platform.EMAIL].extra["address"], "hermes@test.com")
+        self.assertEqual(config.platforms[Platform.EMAIL].extra["imap_host"], "imap.test.com")
+
+    @patch.dict(os.environ, {
+        "LOCALAPPDATA": "C:\\tmp",
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+    }, clear=True)
+    def test_email_config_loaded_from_smtp_only_env(self):
+        from gateway.config import GatewayConfig, Platform, _apply_env_overrides
+        config = GatewayConfig()
+        _apply_env_overrides(config)
+        self.assertIn(Platform.EMAIL, config.platforms)
+        self.assertTrue(config.platforms[Platform.EMAIL].enabled)
+        self.assertEqual(config.platforms[Platform.EMAIL].extra["address"], "hermes@test.com")
+        self.assertEqual(config.platforms[Platform.EMAIL].extra["smtp_host"], "smtp.test.com")
+        self.assertNotIn("imap_host", config.platforms[Platform.EMAIL].extra)
 
     @patch.dict(os.environ, {
         "EMAIL_ADDRESS": "hermes@test.com",
@@ -55,7 +72,7 @@ class TestConfigEnvOverrides(unittest.TestCase):
         self.assertIsNotNone(home)
         self.assertEqual(home.chat_id, "user@test.com")
 
-    @patch.dict(os.environ, {}, clear=True)
+    @patch.dict(os.environ, {"LOCALAPPDATA": "C:\\tmp"}, clear=True)
     def test_email_not_loaded_without_env(self):
         from gateway.config import GatewayConfig, Platform, _apply_env_overrides
         config = GatewayConfig()
@@ -72,6 +89,15 @@ class TestCheckRequirements(unittest.TestCase):
         "EMAIL_SMTP_HOST": "smtp.b.com",
     }, clear=False)
     def test_requirements_met(self):
+        from plugins.platforms.email.adapter import check_email_requirements
+        self.assertTrue(check_email_requirements())
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "a@b.com",
+        "EMAIL_PASSWORD": "pw",
+        "EMAIL_SMTP_HOST": "smtp.b.com",
+    }, clear=True)
+    def test_requirements_met_without_imap(self):
         from plugins.platforms.email.adapter import check_email_requirements
         self.assertTrue(check_email_requirements())
 
@@ -849,6 +875,32 @@ class TestConnectDisconnect(unittest.TestCase):
             result = asyncio.run(adapter.connect())
             self.assertFalse(result)
 
+    def test_connect_smtp_only_success(self):
+        """Without IMAP config, connect() should validate SMTP and skip polling."""
+        import asyncio
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        with patch("imaplib.IMAP4_SSL") as mock_imap, \
+             patch("smtplib.SMTP") as mock_smtp:
+            mock_smtp.return_value = MagicMock()
+
+            result = asyncio.run(adapter.connect())
+
+        self.assertTrue(result)
+        self.assertTrue(adapter._running)
+        self.assertIsNone(adapter._poll_task)
+        mock_imap.assert_not_called()
+        adapter._running = False
+
     def test_disconnect_cancels_poll(self):
         """disconnect() should cancel the polling task."""
         import asyncio
@@ -1435,31 +1487,32 @@ class TestConnectionConfigResolution(unittest.TestCase):
         self.assertEqual(adapter._smtp_host, "smtp.test.com")
         self.assertEqual(adapter._address, "hermes@test.com")
 
-    def test_connect_aborts_without_attempting_imap_when_host_missing(self):
-        """A missing host returns False without the cryptic DNS error, and marks
-        the failure non-retryable so the gateway stops reconnecting (#40715)."""
+    def test_connect_aborts_without_required_smtp_settings(self):
+        """Missing required SMTP settings remains non-retryable (#40715)."""
         import asyncio
         from gateway.config import PlatformConfig
         from plugins.platforms.email.adapter import EmailAdapter
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com",
             "EMAIL_PASSWORD": "secret",
-            "EMAIL_IMAP_HOST": "",
-            "EMAIL_SMTP_HOST": "smtp.test.com",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "",
         }, clear=False):
             adapter = EmailAdapter(PlatformConfig(enabled=True))
 
-        with patch("imaplib.IMAP4_SSL") as mock_imap:
+        with patch("imaplib.IMAP4_SSL") as mock_imap, \
+             patch("smtplib.SMTP") as mock_smtp:
             result = asyncio.run(adapter.connect())
 
         self.assertFalse(result)
         mock_imap.assert_not_called()
-        # The OOM fix (#40715): a blank host must NOT leave the platform in the
-        # retryable reconnect loop — it is a permanent config error.
+        mock_smtp.assert_not_called()
+        # The OOM fix (#40715): blank required settings must NOT leave the
+        # platform in the retryable reconnect loop.
         self.assertTrue(adapter.has_fatal_error)
         self.assertEqual(adapter.fatal_error_code, "email_missing_configuration")
         self.assertFalse(adapter.fatal_error_retryable)
-        self.assertIn("EMAIL_IMAP_HOST", adapter.fatal_error_message or "")
+        self.assertIn("EMAIL_SMTP_HOST", adapter.fatal_error_message or "")
 
     def test_blank_present_env_vars_are_not_required(self):
         """Blank/whitespace EMAIL_* values must read as missing (#40715) — an
@@ -1473,11 +1526,20 @@ class TestConnectionConfigResolution(unittest.TestCase):
                 self.assertFalse(check_email_requirements())
 
     def test_all_settings_present_satisfies_requirements(self):
-        """The connected check passes only when all four settings are non-blank."""
+        """The connected check passes when required SMTP settings are non-blank."""
         from plugins.platforms.email.adapter import check_email_requirements
         with patch.dict(os.environ, {
             "EMAIL_ADDRESS": "hermes@test.com", "EMAIL_PASSWORD": "secret",
             "EMAIL_IMAP_HOST": "imap.test.com", "EMAIL_SMTP_HOST": "smtp.test.com",
+        }, clear=False):
+            self.assertTrue(check_email_requirements())
+
+    def test_imap_host_is_optional_for_requirements(self):
+        """SMTP-only deployments should satisfy the startup gate."""
+        from plugins.platforms.email.adapter import check_email_requirements
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com", "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "", "EMAIL_SMTP_HOST": "smtp.test.com",
         }, clear=False):
             self.assertTrue(check_email_requirements())
 

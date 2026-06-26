@@ -4450,7 +4450,7 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
     },
     "email": {
         "name": "Email",
-        "description": "Talk to Hermes through an IMAP/SMTP mailbox.",
+        "description": "Talk to Hermes through an IMAP/SMTP mailbox, or send via SMTP only.",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/user-guide/messaging/",
         "env_vars": (
             "EMAIL_ADDRESS",
@@ -4461,7 +4461,6 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         "required_env": (
             "EMAIL_ADDRESS",
             "EMAIL_PASSWORD",
-            "EMAIL_IMAP_HOST",
             "EMAIL_SMTP_HOST",
         ),
     },
@@ -4643,8 +4642,8 @@ _MESSAGING_ENV_FALLBACKS: dict[str, dict[str, Any]] = {
         "password": True,
     },
     "EMAIL_IMAP_HOST": {
-        "description": "IMAP server host (e.g. imap.gmail.com)",
-        "prompt": "IMAP host",
+        "description": "Optional IMAP server host for inbound polling (e.g. imap.gmail.com)",
+        "prompt": "IMAP host (optional)",
     },
     "EMAIL_SMTP_HOST": {
         "description": "SMTP server host (e.g. smtp.gmail.com)",
